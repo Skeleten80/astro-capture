@@ -61,15 +61,19 @@ class Session:
         ra_hours: float,
         dec_deg: float,
         temperature_c: float | None = None,
+        target: plan_config.Target | None = None,
     ) -> Path:
+        """Write one frame to FITS. ``target`` overrides ``plan.target``
+        for the OBJECT header (multi-target plans)."""
+        tgt = target or self.plan.target
         self.frame_counters[frame_type] += 1
         n = self.frame_counters[frame_type]
         filt = f"_{step.filter}" if step.filter else ""
-        name = f"{self.plan.target.name}_{frame_type}{filt}_{n:03d}.fits"
+        name = f"{tgt.name}_{frame_type}{filt}_{n:03d}.fits"
         path = self.dir / FRAME_DIRS[frame_type] / name
 
         hdr = fits.Header()
-        hdr["OBJECT"] = (self.plan.target.name, "Target name")
+        hdr["OBJECT"] = (tgt.name, "Target name")
         hdr["RA"] = (ra_hours * 15.0, "[deg] J2000 Right Ascension")
         hdr["DEC"] = (dec_deg, "[deg] J2000 Declination")
         hdr["EXPTIME"] = (step.exposure, "[s] Exposure time")

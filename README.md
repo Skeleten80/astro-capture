@@ -164,6 +164,60 @@ long-exposure deep sky wants a wedge or an equatorial mount. The
 sequencer works either way; when you get a wedge or EQ mount, just raise
 the exposure times in the plan.
 
+## Autonomous imaging
+
+Five optional plan blocks turn a basic capture run into an unattended
+session. All are off by default — a plan without them behaves exactly as
+before. See `examples/mathias_6se_t7i.yaml` for commented examples with
+honest prerequisites.
+
+**1. Target catalog.** `astrocapture/data/catalog.json` vendors **5,045**
+deep-sky objects (**110** Messier, **109** Caldwell, plus NGC/IC and
+more) with J2000 coordinates. `target: {name: "M51"}` resolves RA/Dec
+automatically at plan load; `python -m astrocapture catalog "M51"` looks
+up an object and `tonight --lat/--lon` ranks what's well placed.
+
+**2. Plate-solve recentering.** A per-target `platesolve:` block runs a
+closed loop after each slew: short exposure → local astrometry.net
+`solve-field` → slew to the error-corrected coordinates → re-solve,
+until the residual is within `tolerance_arcmin` (or `max_iterations`
+runs out). A missing `solve-field` binary is *inconclusive, not failed*:
+the block logs "skipped" and imaging continues; only a solver that runs
+but can't converge counts toward the watchdog's failure budget.
+
+**3. Autofocus.** A top-level `autofocus:` block runs a V-curve autofocus
+(sweep the focuser, measure median HFR per position, fit a parabola,
+move to the vertex) before the first light frame, every `every_minutes`,
+and whenever the median light-frame HFR degrades by
+`hfr_degradation_trigger` vs the post-focus baseline. The honest note:
+the stock NexStar 6SE has **no motorized focuser**, so with no focuser
+device configured the sequencer prints the Bahtinov-mask manual focusing
+guide once at session start and continues (manual-assist mode) instead of
+pretending to autofocus.
+
+**4. PHD2 guiding.** A top-level `guiding:` block connects to PHD2's
+JSON-over-TCP API at session start, starts guiding after the first slew,
+and replaces the blind timed dither with `dither()` + a real settle
+handshake. If PHD2 is unreachable the sequencer logs a warning and falls
+back to unguided blind dithers — never a crash. A lost guide star goes
+through the watchdog's retry budget before parking.
+
+**5. Safety watchdog.** Every run gets a `Watchdog`: consecutive
+plate-solve failures park the mount and stop the sequence; an exhausted
+guide-star retry budget does the same; any unexpected exception parks
+the mount, releases the camera, and alerts (swallow-after-parking —
+unattended hardware in an unknown state gets parked, not debugged);
+`max_session_hours` stops the run gracefully on a wall-clock limit.
+Alerts go to `session.log`, or POST to a webhook (`alerts.webhook_url`).
+
+Watch it live:
+
+```bash
+python -m astrocapture dash --config examples/sim_session.yaml --port 8765
+# then open http://localhost:8765 — live frame feed, FITS thumbnails,
+# session log tail, and per-frame stats as the run progresses
+```
+
 ## How it's built
 
 ```
@@ -176,8 +230,16 @@ astrocapture/
     dslr.py    # gphoto2 sketch (import guarded)
   config.py    # plan YAML loading + validation (fails fast, lists all errors)
   sequencer.py # state machine: SLEWING -> EXPOSING -> DITHERING ... DONE
-               # thread-safe pause()/resume()/abort()
+               # thread-safe pause()/resume()/abort(); wires platesolve,
+               # autofocus, PHD2 guiding, and the safety watchdog
   session.py   # session dirs, FITS writer, dither/plate-solve/meridian hooks
+  catalog.py   # vendored night-sky catalog (5,045 objects; name lookup)
+  platesolve.py# solve-field wrapper + closed-loop recenter(); FakeSolver
+  focus.py     # HFR measurement, V-curve autofocus, SimFocuser/INDIFocuser,
+               # manual Bahtinov-mask assist_mode()
+  phd2.py      # PHD2 JSON-over-TCP client (guiding, dither + settle)
+  safety.py    # Watchdog (park/stop/alert policy), AlertLog, WebhookAlert
+  dash.py      # live web dashboard (frame feed, thumbnails, log tail)
   cli.py       # python -m astrocapture
 examples/
   sim_session.yaml    # runs with zero hardware
@@ -228,15 +290,19 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 - Meridian-flip *detection* exists (`check_meridian_flip`); the flip
   itself currently pauses the sequence for you to flip manually.
 - Plate solving shells out to a local `solve-field`; without
-  astrometry.net installed it logs "skipped" and continues.
+  astrometry.net installed the per-target recenter block logs "skipped"
+  and continues (a missing binary is inconclusive, never a failure).
+- The PHD2 client speaks the documented JSON-over-TCP API but has not
+  been exercised against a live PHD2 yet; guiding paths are covered by
+  test doubles in `tests/test_sequencer_integration.py`.
 
 ## Roadmap
 
-- [ ] Autoguiding via the PHD2 API (dither handshake + settle, instead
+- [x] Autoguiding via the PHD2 API (dither handshake + settle, instead
       of the timed settle used now)
-- [ ] Autofocus V-curve routine (sweep focuser, fit HFR curve, move to
+- [x] Autofocus V-curve routine (sweep focuser, fit HFR curve, move to
       best focus; temperature-compensation hooks)
-- [ ] Plate-solve re-centering loop: solve → slew to correct residual →
+- [x] Plate-solve re-centering loop: solve → slew to correct residual →
       re-solve until within tolerance
 - [ ] Automated meridian flip: re-slew, re-center, resume guiding
 - [ ] ASCOM Alpaca backend (Windows/remote-driver option)
@@ -246,13 +312,22 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-# 41 passed
+# 108 passed
 ```
 
-Covers: plan validation (incl. multi-error reporting), sim slew math
-(monotonic approach, rate timing, RA wrap, park), synthetic image
-properties (shape/dtype, exposure scaling, dither shift, FITS
-round-trip), sequencer state machine (full run, pause/resume, abort),
-FITS header contents, and the pure-Python INDI client (handshake, goto
-RA/Dec XML, park switch, slew Busy→Ok, exposure → real FITS bytes via a
-scripted fake INDI server).
+Covers: plan validation (incl. multi-error reporting and the new
+autonomous-imaging blocks), sim slew math (monotonic approach, rate
+timing, RA wrap, park), synthetic image properties (shape/dtype,
+exposure scaling, dither shift, FITS round-trip), sequencer state
+machine (full run, pause/resume, abort), FITS header contents, the
+pure-Python INDI client (handshake, goto RA/Dec XML, park switch, slew
+Busy→Ok, exposure → real FITS bytes via a scripted fake INDI server),
+the night-sky catalog (5,045 objects, lookup, tonight ranking), HFR
+measurement + V-curve autofocus (SimFocuser, INDIFocuser against a fake
+server, manual assist mode), plate solving + closed-loop recentering
+(FakeSolver), the PHD2 client (protocol framing, dither/settle,
+star-lost), the safety watchdog (solve-failure parking, guide retry
+budget, exceptions, session limits, webhooks), and the sequencer
+integration of all five (platesolve success/failure, multi-target runs,
+autofocus, PHD2 fallback, guide-lost parking, exception parking, config
+validation).

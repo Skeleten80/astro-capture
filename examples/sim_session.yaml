@@ -26,3 +26,46 @@ sequence:
   - {type: dark, exposure: 2, count: 2, gain: 1600}
   - {type: flat, filter: L, exposure: 0.5, count: 2, gain: 1600}
   - {type: bias, count: 3, gain: 1600}
+
+# ---------------------------------------------------------------------------
+# Autonomous imaging blocks (all optional). Uncomment to exercise them in
+# the simulator.
+#
+# NOTE on platesolve: the sim has no solve-field binary, so an enabled
+# platesolve block is *skipped* with a log line here (a missing binary is
+# inconclusive, never a failure). It is exercised against FakeSolver in
+# tests/test_sequencer_integration.py instead.
+# ---------------------------------------------------------------------------
+
+#targets:
+#  - name: "M51"
+#    platesolve: {enabled: false, tolerance_arcmin: 2.0,
+#                 max_iterations: 5, exposure_s: 5.0}
+
+# On the sim rig the sequencer uses SimFocuser automatically, so this
+# exercises the real autofocus path (V-curve scan, parabola fit, move to
+# best focus, HFR degradation tracking) with no hardware.
+#autofocus:
+#  enabled: true
+#  every_minutes: 60
+#  hfr_degradation_trigger: 1.25
+#  focuser_device: ""     # unused on the sim rig (SimFocuser)
+#  focus_exposure_s: 2.0
+
+# Guiding without a PHD2 server: the sequencer logs a warning and falls
+# back to blind dithers, so the session still completes.
+#guiding:
+#  enabled: true
+#  phd2_host: localhost
+#  phd2_port: 4400
+#  dither_pixels: 5.0
+#  settle_pixels: 1.5
+#  settle_time_s: 10
+
+#safety:
+#  max_session_hours: null
+#  max_solve_failures: 3
+#  guide_retry_budget: 3
+
+#alerts:
+#  webhook_url: ""

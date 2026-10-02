@@ -55,3 +55,60 @@ sequence:
   - {type: flat, exposure: 0.5, count: 20, gain: 1600}
   # Bias: shortest exposure the camera allows, cap on, ISO 1600.
   - {type: bias, exposure: 0.001, count: 30, gain: 1600}
+
+# ---------------------------------------------------------------------------
+# Autonomous imaging blocks (all optional; the plan above runs fine without
+# any of them). Uncomment and tune once the prerequisites are in place.
+# ---------------------------------------------------------------------------
+
+# Per-target platesolve: after each slew, the sequencer takes a short
+# exposure, plate-solves it, and nudges the mount until the target is
+# centered within tolerance_arcmin.
+# PREREQUISITE: astrometry.net installed locally (the `solve-field`
+# binary). Without it the block is skipped with a log line — never an
+# error. Helpful on the 6SE: its ~0.5° FOV makes manual centering fiddly.
+#targets:
+#  - name: "M13"
+#    platesolve: {enabled: true, tolerance_arcmin: 2.0,
+#                 max_iterations: 5, exposure_s: 5.0}
+
+# Autofocus schedule.
+# HONEST NOTE: the stock NexStar 6SE has NO motorized focuser, so there is
+# nothing for autofocus() to drive. With enabled: true and no focuser
+# device, the sequencer prints the Bahtinov-mask manual focusing guide
+# once at session start and continues (manual-assist mode). Add a
+# motorized focuser (e.g. Celestron SCT focus motor on the rear cell,
+# visible to indiserver as an INDI focuser device) and set its device
+# name below to get real V-curve autofocus.
+#autofocus:
+#  enabled: true
+#  every_minutes: 60        # refocus cadence (SCT focus drifts as it cools)
+#  hfr_degradation_trigger: 1.25  # refocus when median light-frame HFR
+#                                 # degrades 25% vs the post-focus baseline
+#  focuser_device: ""       # <-- EDIT: your INDI focuser device name, e.g. "Celestron Focuser"
+#  focus_exposure_s: 5.0
+
+# PHD2 guiding (optional). Needs PHD2 running with its TCP server enabled
+# (Tools > Enable Server, default port 4400) and a guide camera + guide
+# scope (or OAG) on the 6SE. When enabled, dithers go through PHD2 with a
+# real settle handshake instead of the blind timed settle. If PHD2 is not
+# reachable at session start, the sequencer logs a warning and continues
+# unguided — it never crashes the run.
+#guiding:
+#  enabled: true
+#  phd2_host: localhost
+#  phd2_port: 4400
+#  dither_pixels: 5.0
+#  settle_pixels: 1.5
+#  settle_time_s: 10
+
+# Safety watchdog policy.
+#safety:
+#  max_session_hours: null  # wall-clock limit; null = run until the plan ends
+#  max_solve_failures: 3    # consecutive platesolve failures before parking
+#  guide_retry_budget: 3     # lost-guide-star retries before parking
+
+# Alerts: the watchdog POSTs {"text": ...} here on park/stop events.
+# Leave empty to log alerts to session.log only.
+#alerts:
+#  webhook_url: ""          # e.g. an ntfy/Slack/Discord webhook URL

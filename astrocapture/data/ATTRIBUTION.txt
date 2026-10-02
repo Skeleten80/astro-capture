@@ -1,0 +1,12 @@
+Night-sky catalog data sources
+================================
+
+OpenNGC — open deep-sky object database
+  https://raw.githubusercontent.com/mattiaverga/OpenNGC/master/database_files/NGC.csv and addendum.csv (tag/branch: master)
+  © Mattia Verga and contributors — CC-BY-SA-4.0
+  https://github.com/mattiaverga/OpenNGC
+
+Caldwell designations cross-checked against the Caldwell catalogue
+table on Wikipedia (https://en.wikipedia.org/wiki/Caldwell_catalogue).
+
+This derived catalog.json is therefore distributed under CC-BY-SA-4.0.
