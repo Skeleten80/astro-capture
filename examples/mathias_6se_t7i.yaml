@@ -1,0 +1,57 @@
+# Mathias's real gear: Celestron NexStar 6SE (alt-az GoTo) + Canon EOS Rebel T7i.
+#
+# BEFORE YOU RUN THIS:
+#   1. Power the mount, then STAR-ALIGN FROM THE HAND CONTROLLER
+#      (SkyAlign / auto two-star). INDI cannot do the initial alignment.
+#   2. Camera in Manual (M) mode, manual focus, RAW, auto power-off OFF.
+#      Attach via T-ring + 1.25" nosepiece / SCT T-adapter on the rear cell.
+#   3. Plug in: hand-controller base USB (or USB-to-serial) -> laptop,
+#      camera USB -> laptop. Mount on its own 12V supply.
+#   4. Start the server:  indiserver indi_celestron_gps indi_gphoto_cc -p 7624 &
+#   5. Confirm device names:  indi_getprop   ("Celestron GPS", "Canon DSLR")
+#   6. Find your serial port:  ls /dev/ttyUSB* /dev/ttyACM*   (after plugging
+#      in the hand controller; dialout group required: sudo usermod -aG dialout $USER)
+#
+# Run:  python -m astrocapture --config examples/mathias_6se_t7i.yaml
+#
+# FIELD-ROTATION NOTE (alt-az mount!): without an equatorial wedge the sky
+# rotates in the frame, so keep light subs to ~20-30 s (shorter near the
+# zenith / for targets far from the celestial pole). Long-exposure deep sky
+# really wants a wedge or an EQ mount — the sequencer works either way.
+session:
+  name: "m13-6se-t7i"
+  output_dir: "sessions"
+  target: {name: "M13", ra_hours: 16.6950, dec_deg: 36.4600}
+  telescope: "Celestron NexStar 6SE (150mm f/10 SCT, alt-az)"
+  instrument: "Canon EOS Rebel T7i (800D)"
+  cooler_temp_c: null       # DSLR: no cooler
+  meridian_flip: false      # alt-az fork: no meridian flip needed
+  plate_solve: false        # enable once astrometry.net is installed (helps the 6SE's narrow ~0.5° FOV)
+
+mount:
+  driver: indi
+  host: localhost
+  port: 7624
+  device: "Celestron GPS"   # indi_celestron_gps device name; exact string required
+  serial_port: /dev/ttyUSB0 # <-- EDIT: your hand-controller serial port (see step 6 above)
+  # baud is 9600 for the NexStar+ hand controller; set in the driver's
+  # CONNECTION tab if the default is wrong.
+
+camera:
+  driver: indi
+  host: localhost
+  port: 7624
+  device: "Canon DSLR"      # indi_gphoto_cc device name; exact string required
+  upload_mode: client       # keep "client": frames stream to this machine
+
+sequence:
+  # 25 s is a safe first-light sub on the alt-az 6SE. ISO 1600 is the
+  # T7i's sweet spot for deep sky (good SNR, still decent dynamic range).
+  - {type: light, exposure: 25, count: 30, gain: 1600, dither_every: 3}
+  # Darks must match the lights: same exposure, same ISO, cap on, ~same temp.
+  - {type: dark, exposure: 25, count: 15, gain: 1600}
+  # Flats: T-shirt / dusk-sky method. Adjust exposure so the histogram peak
+  # sits ~1/3 to 1/2; keep ISO 1600 to match the lights.
+  - {type: flat, exposure: 0.5, count: 20, gain: 1600}
+  # Bias: shortest exposure the camera allows, cap on, ISO 1600.
+  - {type: bias, exposure: 0.001, count: 30, gain: 1600}

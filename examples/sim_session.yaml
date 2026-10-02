@@ -1,0 +1,28 @@
+# Full simulated session: runs end-to-end with no hardware.
+# M51 through a small refractor + simulated camera.
+session:
+  name: "m51-sim"
+  output_dir: "sessions"
+  target: {name: "M51", ra_hours: 13.4979, dec_deg: 47.1953}
+  telescope: "Simulated 100mm f/7 refractor"
+  instrument: "SimCam 1024"
+  cooler_temp_c: -10.0
+  meridian_flip: false   # sim has no LST model; flip logic is tested in unit tests
+  plate_solve: false
+
+mount:
+  driver: sim
+  slew_rate_dps: 30.0    # fast slew so the demo finishes quickly
+
+camera:
+  driver: sim
+  width: 512
+  height: 512
+  n_stars: 200
+  seed: 7
+
+sequence:
+  - {type: light, filter: L, exposure: 2, count: 4, gain: 1600, dither_every: 2}
+  - {type: dark, exposure: 2, count: 2, gain: 1600}
+  - {type: flat, filter: L, exposure: 0.5, count: 2, gain: 1600}
+  - {type: bias, count: 3, gain: 1600}

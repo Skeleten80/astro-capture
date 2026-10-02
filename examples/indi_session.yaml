@@ -1,0 +1,35 @@
+# Real-hardware template: INDI server + EQMod mount + DSLR via indi_gphoto_cc.
+# Copy this, fill in YOUR device names (exactly as indiserver lists them),
+# and run:  python -m astrocapture --config my_session.yaml
+#
+# Start the server first, e.g.:
+#   indiserver indi_eqmod_telescope indi_gphoto_cc -p 7624 &
+# Find device names with:  indi_getprop   (after the server is up)
+session:
+  name: "m51-real"
+  output_dir: "sessions"
+  target: {name: "M51", ra_hours: 13.4979, dec_deg: 47.1953}
+  telescope: "YOUR TELESCOPE HERE"
+  instrument: "YOUR CAMERA HERE"
+  cooler_temp_c: null        # set to e.g. -10.0 for a cooled astro camera
+  meridian_flip: true
+  plate_solve: true          # needs local astrometry.net (solve-field)
+
+mount:
+  driver: indi
+  host: localhost
+  port: 7624
+  device: "EQMod Mount"      # <-- replace with your mount's INDI device name
+
+camera:
+  driver: indi
+  host: localhost
+  port: 7624
+  device: "Canon DSLR"       # <-- replace with your camera's INDI device name
+  upload_mode: client        # keep "client": frames stream to this machine
+
+sequence:
+  - {type: light, filter: L, exposure: 120, count: 12, gain: 1600, dither_every: 3}
+  - {type: dark, exposure: 120, count: 10, gain: 1600}
+  - {type: flat, filter: L, exposure: 2, count: 20, gain: 1600}
+  - {type: bias, count: 30, gain: 1600}
