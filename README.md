@@ -7,7 +7,8 @@ dithers between frames, and saves calibrated FITS files with proper
 headers into a timestamped session directory.
 
 **Status: v0.1.0 scaffold. The simulator runs end-to-end today. The INDI
-and DSLR backends are written but have NOT been tested against real
+backend is a pure-Python protocol client (no compiled dependencies —
+runs on Linux, macOS and Windows) but has NOT been tested against real
 hardware** — see [Caveats](#caveats).
 
 ## Quick start (no hardware needed)
@@ -28,41 +29,70 @@ python -m astrocapture --config examples/sim_session.yaml
 python -m astrocapture --list-drivers
 ```
 
-## Install (Ubuntu, for real hardware)
+## Install
+
+**Recommended architecture:** `indiserver` runs on a small Linux box at
+the scope (a Raspberry Pi is the classic choice — it holds the USB
+cables to the mount and camera). AstroCapture runs on whatever laptop
+you have and talks to it over the network, since INDI is a network
+protocol:
+
+```
+  [laptop: macOS / Windows / Linux] --TCP 7624--> [Pi at the scope]
+   AstroCapture (pure-Python            indiserver + drivers
+   INDI client, zero compiled deps)     (indi_celestron_gps, indi_gphoto_cc, ...)
+```
+
+On the Pi (Ubuntu/Debian):
 
 ```bash
 # INDI server + drivers
 sudo apt install indi-bin
+#   Celestron NexStar: sudo apt install indi-bin   # indi_celestron_gps ships with indi-bin
 #   EQMod mounts:      sudo apt install indi-eqmod
 #   ZWO cameras:       sudo apt install indi-asi
 #   DSLR via INDI:     sudo apt install indi-gphoto
 
 # DSLR USB support (also needed by indi-gphoto)
 sudo apt install libgphoto2-6
+```
 
-# Python side
+On the laptop (Linux, macOS Intel/Apple Silicon, or Windows 11):
+
+```bash
 pip install -r requirements.txt
-pip install PyIndi-Client   # only needed for driver: indi
-pip install gphoto2         # only needed for driver: dslr (direct USB)
+# that's it for driver: indi — the INDI client is pure Python (stdlib
+# socket + XML), no PyIndi-Client, no compiler needed.
+pip install gphoto2   # only needed for driver: dslr (direct USB, Linux/macOS)
 ```
 
 ## Pointing it at real hardware
 
-1. Start the INDI server with the drivers for *your* gear:
+1. Start the INDI server with the drivers for *your* gear (on the Pi,
+   or on the laptop itself if it's Linux):
    ```bash
-   indiserver indi_eqmod_telescope indi_gphoto_cc -p 7624 &
+   indiserver indi_celestron_gps indi_gphoto_cc -p 7624 &
    ```
 2. List the exact device names the server exposes:
    ```bash
    indi_getprop | grep -E "CONNECTION" | head
    ```
-   (Device names look like `"EQMod Mount"`, `"Canon DSLR"` — copy them
-   exactly, quotes and all.)
+   (Device names look like `"Celestron GPS"`, `"Canon DSLR"` — copy
+   them exactly, quotes and all.)
 3. Copy `examples/indi_session.yaml`, fill in your device names,
-   telescope/camera strings, and exposure plan, then:
+   telescope/camera strings, the server's `host`/`port`, and the
+   exposure plan, then:
    ```bash
    python -m astrocapture --config my_session.yaml
    ```
+
+AstroCapture's INDI backend (`drivers/indi.py`) speaks the INDI v1.7
+XML protocol directly over the socket — `<getProperties>`,
+`newNumberVector`/`newSwitchVector`/`newTextVector` commands,
+`setXXXVector` state updates, and base64 BLOB frames after
+`<enableBLOB>`. No PyIndi-Client needed (it currently fails to build
+against modern libindi anyway), so the client runs anywhere Python
+runs.
 
 ### DSLR-over-USB notes
 
@@ -141,7 +171,8 @@ astrocapture/
   drivers/
     base.py    # Mount + Camera abstract interfaces
     sim.py     # SimMount (great-circle slews) + SimCamera (synthetic starfield)
-    indi.py    # PyIndi-Client backend (import guarded)
+    indi.py    # pure-Python INDI v1.7 protocol client (stdlib only:
+               # socket + XML, no PyIndi-Client, works on Linux/macOS/Windows)
     dslr.py    # gphoto2 sketch (import guarded)
   config.py    # plan YAML loading + validation (fails fast, lists all errors)
   sequencer.py # state machine: SLEWING -> EXPOSING -> DITHERING ... DONE
@@ -157,9 +188,9 @@ tests/                # pytest tests, all passing
 
 **Design rules:** the sequencer only talks to the abstract `Mount` /
 `Camera`, so a new backend (ASCOM Alpaca, a vendor SDK) is one new file
-plus a registry entry. Optional dependencies are guarded — `import
-astrocapture` works on any machine; you get a clear error only when you
-*select* a backend whose package is missing.
+plus a registry entry. The INDI backend has zero optional dependencies
+— `import astrocapture` works on any machine, and only the
+direct-gphoto2 sketch raises a clear error when its package is missing.
 
 **Simulator fidelity notes:** `SimMount` slews along the great circle at
 a configurable deg/sec (verified against slew-rate math in tests).
@@ -183,12 +214,16 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 
 ## Caveats
 
-- **Not yet tested against real hardware.** The INDI backend is written
-  against the PyIndi-Client API and standard INDI property names
-  (`EQUATORIAL_EOD_COORD`, `TELESCOPE_PARK`, `CCD_EXPOSURE`, …), but
-  property names vary between drivers — expect a debugging session with
-  `indi_getprop` on first light. Known variation points are marked in
-  `drivers/indi.py` comments.
+- **Not yet tested against real hardware.** The INDI backend speaks the
+  INDI v1.7 XML protocol directly (verified against the spec, and
+  exercised end-to-end against a scripted fake server in
+  `tests/test_indi_proto.py`), using standard INDI property names
+  (`EQUATORIAL_EOD_COORD`, `TELESCOPE_PARK`, `CCD_EXPOSURE`, …) — but
+  property names vary between drivers, so expect a debugging session
+  with `indi_getprop` on first light. Known variation points are marked
+  in `drivers/indi.py` comments. (The old PyIndi-Client approach was
+  dropped because that package currently fails to build against modern
+  libindi.)
 - The gphoto2 backend's bulb path is per-model and untested.
 - Meridian-flip *detection* exists (`check_meridian_flip`); the flip
   itself currently pauses the sequence for you to flip manually.
@@ -211,11 +246,13 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-# 36 passed
+# 41 passed
 ```
 
 Covers: plan validation (incl. multi-error reporting), sim slew math
 (monotonic approach, rate timing, RA wrap, park), synthetic image
 properties (shape/dtype, exposure scaling, dither shift, FITS
 round-trip), sequencer state machine (full run, pause/resume, abort),
-and FITS header contents.
+FITS header contents, and the pure-Python INDI client (handshake, goto
+RA/Dec XML, park switch, slew Busy→Ok, exposure → real FITS bytes via a
+scripted fake INDI server).

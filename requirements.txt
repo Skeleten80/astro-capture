@@ -2,7 +2,8 @@ astropy>=6.0
 numpy>=1.24
 PyYAML>=6.0
 # Optional backends (install only what you need):
-# PyIndi-Client   # INDI mount + camera control
 # gphoto2         # direct DSLR-over-USB (libgphoto2 system package required)
 # Pillow          # JPEG decode fallback for the gphoto2 sketch
 # rawpy           # DSLR raw decode for the gphoto2 sketch
+# NOTE: the INDI backend needs no extra Python packages — it speaks the
+# INDI XML protocol over a plain TCP socket (pure stdlib).

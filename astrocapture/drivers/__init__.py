@@ -1,10 +1,12 @@
 """Driver registry: ``make_mount(kind, **kw)`` / ``make_camera(kind, **kw)``.
 
 ``kind`` is one of ``"sim"``, ``"indi"`` (mount + camera) or ``"dslr"``
-(camera only).  The ``indi`` and ``dslr`` modules guard their optional
-third-party imports so *this* package imports cleanly on any machine —
-a clear error is raised only if you actually select a backend whose
-dependency is missing.
+(camera only).  The ``indi`` backend speaks the INDI XML protocol over a
+plain socket — no compiled dependencies, so it works on Linux, macOS
+and Windows out of the box.  Only the direct-``gphoto2`` sketch guards
+its third-party import: this package always imports cleanly, and you get
+a clear error only if you select the ``dslr`` backend without gphoto2
+installed.
 """
 
 from __future__ import annotations
