@@ -1,0 +1,53 @@
+# Dew-heater demo (simulated): watch the heater duty ramp in the log as
+# the scripted night air cools toward the dew point.
+#
+# Run:  python -m astrocapture --config examples/dew_demo.yaml
+# Then grep the session log, e.g.:
+#   grep "dew:" sessions/dew-demo-*/session.log
+#
+# The sim sensor plays a scripted humid night (22°C/47% RH falling to
+# 8.5°C while absolute humidity stays constant, so RH climbs to 100%).
+# One dew update runs per light frame; expect duty 0% on frame 1 and a
+# steady ramp toward max_duty as the air nears the dew point.
+#
+# Hardware note: this exercises the software side only. Real dew control
+# needs a 12 V dew strap + PWM controller and (optionally) a
+# temperature/humidity sensor — see the dew: block in
+# examples/mathias_6se_t7i.yaml-style INDI configs (sensor/heater driver:
+# indi, with your device + property names).
+session:
+  name: "dew-demo"
+  output_dir: "sessions"
+  target: {name: "M51", ra_hours: 13.4979, dec_deg: 47.1953}
+  telescope: "Simulated 100mm f/7 refractor"
+  instrument: "SimCam 256"
+  meridian_flip: false
+
+mount:
+  driver: sim
+  slew_rate_dps: 360.0
+
+camera:
+  driver: sim
+  width: 256
+  height: 256
+  n_stars: 60
+  seed: 5
+
+sequence:
+  - {type: light, exposure: 0.5, count: 6, gain: 1600}
+
+dew:
+  enabled: true
+  margin_c: 2.0         # start heating 2°C above the dew point
+  aggressiveness: 0.7   # 70% of max_duty right at the margin boundary
+  max_duty: 0.9
+  sensor:
+    driver: sim
+    # SimSensor.humid_night options: a fast-cooling night so the ramp is
+    # visible over just 6 frames.
+    start_temp_c: 22.0
+    start_rh_pct: 46.7
+    end_temp_c: 8.5
+    steps: 6
+  heater: {driver: sim}

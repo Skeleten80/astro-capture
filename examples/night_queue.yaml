@@ -1,0 +1,60 @@
+# Multi-target night queue (simulated): the scheduler works the targets:
+# list until astronomical dawn, picking whatever is highest and farthest
+# from the Moon, then writes night_summary.md next to the session dirs.
+#
+# Demo notes:
+# - M81 (Dec +69°) is circumpolar from mid-northern latitudes, so this
+#   demo starts imaging immediately no matter what time you run it.
+# - If the Moon sits within min_moon_sep_deg of every target, the
+#   scheduler fast-forwards (time_accel) until something clears — a
+#   whole empty night takes seconds in sim.
+# - Run:  python -m astrocapture night --config examples/night_queue.yaml
+# - Check what is really up tonight first:
+#   python -m astrocapture tonight --lat 43.3767 --lon -80.9809
+session:
+  name: "night-demo"
+  output_dir: "sessions"
+  target: {name: "M81"}   # legacy single target; targets[0] below wins
+  telescope: "Simulated 100mm f/7 refractor"
+  instrument: "SimCam 256"
+  meridian_flip: false
+
+mount:
+  driver: sim
+  slew_rate_dps: 360.0    # fast slew so the demo finishes quickly
+
+camera:
+  driver: sim
+  width: 256
+  height: 256
+  n_stars: 60
+  seed: 11
+
+# Each target gets this full light sequence as its quota.
+sequence:
+  - {type: light, exposure: 0.5, count: 2, gain: 1600}
+
+targets:
+  - name: "M81"    # Bode's Galaxy — circumpolar from Stratford, always up
+    priority: 2.0  # observed first when several targets are eligible
+  - name: "M51"    # Whirlpool Galaxy
+    priority: 1.0
+  - name: "M13"    # Great Hercules Cluster
+    priority: 1.0
+
+night:
+  latitude: 43.3767     # Stratford, Ontario
+  longitude: -80.9809
+  min_alt_deg: 10.0     # lenient for the demo; 30 is a saner real value
+  min_moon_sep_deg: 15.0
+  time_accel: 3600.0    # 1 real second == 1 sim hour while waiting
+
+# Dew control runs in the sim too: the scripted night air cools toward
+# the dew point and the log shows the heater duty ramping per frame.
+dew:
+  enabled: true
+  margin_c: 2.0
+  aggressiveness: 0.5
+  max_duty: 0.9
+  sensor: {driver: sim}
+  heater: {driver: sim}

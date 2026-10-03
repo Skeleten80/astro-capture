@@ -116,6 +116,8 @@
   #step-list li.active { color: var(--text); }
   #step-list li.active .counts { color: var(--accent); }
   #thumbnail { width: 100%; border-radius: 12px; display: block; background: #000; }
+  #live-stack { width: 100%; border-radius: 12px; display: block; background: #000; }
+  #live-caption { color: var(--muted); font-size: 0.85em; margin-top: 6px; }
   #thumb-caption { margin-top: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
   #log {
     font-family: var(--mono); font-size: 12px; line-height: 1.55;
@@ -193,6 +195,12 @@
     <h2>Latest frame</h2>
     <img id="thumbnail" alt="Latest captured frame" src="">
     <div id="thumb-caption">waiting for first frame…</div>
+  </section>
+
+  <section class="card span4">
+    <h2>Live stack (EAA)</h2>
+    <img id="live-stack" alt="Live stacked image" src="">
+    <div id="live-caption">waiting for first light frame…</div>
   </section>
 
   <section class="card span12">
@@ -285,6 +293,7 @@ function update(state) {
   }
 
   $("thumb-caption").textContent = state.latest_frame || "waiting for first frame…";
+  updateLiveCaption(state);
 }
 
 async function refreshState() {
@@ -301,6 +310,27 @@ function refreshThumb() {
   img.src = "/api/thumbnail?t=" + Date.now();
 }
 $("thumbnail").addEventListener("error", () => { $("thumbnail").removeAttribute("src"); });
+
+// Live EAA stack: the caption rides along with /api/state (updated in
+// updateLiveCaption below); the image itself refreshes on its own timer.
+function refreshLiveImg() {
+  const img = $("live-stack");
+  img.src = "/api/live.png?t=" + Date.now();
+}
+$("live-stack").addEventListener("error", () => { $("live-stack").removeAttribute("src"); });
+setInterval(refreshLiveImg, 5000);
+
+function updateLiveCaption(state) {
+  const live = state && state.live;
+  if (live && live.frames > 0) {
+    const snr = (live.snr_db === null || live.snr_db === undefined) ? "—" : live.snr_db.toFixed(1) + " dB";
+    $("live-caption").textContent =
+      live.frames + " frames · SNR " + snr +
+      " · shift (" + live.last_shift_px[0] + ", " + live.last_shift_px[1] + ") px";
+  } else {
+    $("live-caption").textContent = "waiting for first light frame…";
+  }
+}
 
 // Session log via SSE, with sticky auto-scroll.
 const logEl = $("log");
@@ -348,6 +378,7 @@ $("btn-abort").addEventListener("click", async () => {
 
 refreshState();
 refreshThumb();
+refreshLiveImg();
 setInterval(refreshState, 2000);
 setInterval(refreshThumb, 4000);
 </script>

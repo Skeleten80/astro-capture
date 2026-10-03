@@ -13,6 +13,8 @@ Endpoints::
     GET  /              dashboard page
     GET  /api/state     session/target/mount/camera/plan snapshot (JSON)
     GET  /api/thumbnail most recent FITS frame, auto-stretched (PNG)
+    GET  /api/live.png  live EAA stack, auto-stretched (PNG; 404 until the
+                        first light frame lands)
     GET  /api/log       session.log tail as Server-Sent Events
     POST /api/pause     pause the sequencer
     POST /api/resume    resume the sequencer
@@ -22,8 +24,8 @@ Endpoints::
 from __future__ import annotations
 
 import functools
-import io
 import json
+import logging
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +36,8 @@ from astropy.io import fits
 
 from astrocapture import config
 from astrocapture.drivers import make_camera, make_mount
+from astrocapture.eaa import LiveStacker
+from astrocapture.imaging import stretch_png
 from astrocapture.sequencer import SeqState, Sequencer
 
 try:  # Pillow is optional at import time; /api/thumbnail 503s without it.
@@ -44,6 +48,8 @@ except ImportError:  # pragma: no cover - pillow is a real dependency
 _HTML_PATH = Path(__file__).with_name("dash.html")
 _THUMB_MAX_PX = 640
 _LOG_BACKLOG_LINES = 200
+
+log = logging.getLogger(__name__)
 
 
 # -- optional target catalog -------------------------------------------------
@@ -127,6 +133,8 @@ class AstroDash:
         # Record completed frames: only paths returned by save_frame are
         # "latest" — a directory scan could catch a FITS mid-write.
         self._latest_frame_path: Path | None = None
+        # EAA live stack: every light frame is folded in as it is saved.
+        self._live = LiveStacker()
         orig_save_frame = self.seq.session.save_frame
 
         @functools.wraps(orig_save_frame)
@@ -134,6 +142,14 @@ class AstroDash:
             path = orig_save_frame(*args, **kwargs)
             with self._lock:
                 self._latest_frame_path = Path(path)
+                frame_type = kwargs.get("frame_type")
+                if frame_type is None and len(args) >= 2:
+                    frame_type = args[1]
+                if frame_type == "light" and args:
+                    try:
+                        self._live.add_frame(np.asarray(args[0]))
+                    except Exception:  # noqa: BLE001 - live view never breaks capture
+                        log.exception("live stack: failed to add frame")
             return path
 
         self.seq.session.save_frame = _recording_save_frame
@@ -247,6 +263,7 @@ class AstroDash:
                 },
                 "camera": self._camera_snapshot(),
                 "latest_frame": latest.name if latest is not None else None,
+                "live": self.live_state(),
             }
 
     def _mount_snapshot(self) -> tuple[str, float | None, float | None]:
@@ -361,22 +378,30 @@ class AstroDash:
         if latest is None:
             return None
         data = fits.getdata(str(latest)).astype(np.float64)
-        # Percentile stretch on a stride for very large sensors.
-        sample = data
-        if sample.size > 1_000_000:
-            stride = int((sample.size / 1_000_000) ** 0.5) + 1
-            sample = data[::stride, ::stride]
-        lo, hi = (float(v) for v in np.percentile(sample, (1.0, 99.5)))
-        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
-            lo, hi = float(data.min()), float(data.max())
-            if hi <= lo:
-                hi = lo + 1.0
-        norm = np.clip((data - lo) / (hi - lo), 0.0, 1.0)
-        img = Image.fromarray((norm * 255.0).astype(np.uint8))
-        img.thumbnail((max_px, max_px), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
+        return stretch_png(data, max_px)
+
+    # -- live stack (EAA) ------------------------------------------------------
+    def live_png(self, max_px: int = _THUMB_MAX_PX) -> bytes | None:
+        """Auto-stretched PNG of the live EAA stack (None if no frames yet)."""
+        if Image is None:
+            raise RuntimeError("Pillow is not installed; cannot render live stack")
+        with self._lock:
+            stack = self._live.stack
+        if stack is None:
+            return None
+        return stretch_png(stack, max_px)
+
+    def live_state(self) -> dict:
+        """Small live-stack snapshot for /api/state (thread-safe)."""
+        with self._lock:
+            n = self._live.n_frames
+            snr = self._live.snr_db() if n else None
+            dx, dy = self._live.last_shift
+        return {
+            "frames": n,
+            "snr_db": round(snr, 1) if snr is not None else None,
+            "last_shift_px": [round(dx, 2), round(dy, 2)],
+        }
 
     # -- HTTP ------------------------------------------------------------------
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
@@ -422,6 +447,8 @@ class AstroDash:
                         self._send_json(200, dash.state_dict())
                     elif path == "/api/thumbnail":
                         dash._serve_thumbnail(self)
+                    elif path == "/api/live.png":
+                        dash._serve_live(self)
                     elif path == "/api/log":
                         dash._serve_log_stream(self)
                     else:
@@ -470,6 +497,22 @@ class AstroDash:
             return
         if png is None:
             handler._send_json(404, {"ok": False, "error": "no frames captured yet"})
+            return
+        handler.send_response(200)
+        handler.send_header("Content-Type", "image/png")
+        handler.send_header("Content-Length", str(len(png)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(png)
+
+    def _serve_live(self, handler: BaseHTTPRequestHandler) -> None:
+        try:
+            png = self.live_png()
+        except RuntimeError as exc:
+            handler._send_json(503, {"ok": False, "error": str(exc)})
+            return
+        if png is None:
+            handler._send_json(404, {"ok": False, "error": "no light frames stacked yet"})
             return
         handler.send_response(200)
         handler.send_header("Content-Type", "image/png")

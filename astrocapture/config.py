@@ -15,14 +15,16 @@ plan load time and the matched designations are recorded on the target.
 
 A multi-target night uses the optional top-level ``targets:`` list
 instead; each entry resolves like ``session.target`` and carries its own
-``platesolve`` block.  The sequencer slews to each target in turn and
-runs the full step sequence on each.
+``platesolve`` block and an optional ``priority:`` weight (default 1.0)
+used by the night scheduler.  The sequencer slews to each target in turn
+and runs the full step sequence on each.
 
 Optional autonomous-imaging blocks (all off by default; a plan without
 them behaves exactly as before)::
 
     targets:
       - name: "M51"
+        priority: 2.0
         platesolve: {enabled: true, tolerance_arcmin: 2.0,
                      max_iterations: 5, exposure_s: 5.0}
     autofocus:
@@ -44,6 +46,19 @@ them behaves exactly as before)::
       guide_retry_budget: 3
     alerts:
       webhook_url: ""            # http(s) webhook for watchdog alerts
+    dew:
+      enabled: false
+      margin_c: 2.0              # stay this far above the dew point
+      aggressiveness: 0.5        # duty fraction at the margin boundary
+      max_duty: 0.9              # hard cap on heater power (0..1]
+      sensor: {driver: sim}      # sim | indi (weather device)
+      heater: {driver: sim}      # sim | indi (dew strap controller)
+    night:
+      latitude: 43.3767         # required when the block is present
+      longitude: -80.9809        # required when the block is present
+      min_alt_deg: 30            # target must be this high to be picked
+      min_moon_sep_deg: 30       # ... and this far from the Moon
+      time_accel: 1.0            # sim fast-forward for waiting (>= 1)
 
     mount:
       driver: sim
@@ -115,9 +130,12 @@ class TargetEntry:
     ``targets:`` is the multi-target spelling of ``session.target``; each
     entry resolves its name through the night-sky catalog exactly like
     the legacy single target and carries its own platesolve block.
+    ``priority`` weights the entry in the night scheduler's target
+    scoring (higher = observed first when several targets are up).
     """
     target: Target
     platesolve: PlateSolveBlock = field(default_factory=PlateSolveBlock)
+    priority: float = 1.0
 
 
 @dataclass
@@ -167,6 +185,42 @@ class AlertsConfig:
 
 
 @dataclass
+class DewConfig:
+    """Dew heater control (top-level ``dew:`` block).
+
+    When ``enabled``, the sequencer arms a
+    :class:`~astrocapture.dew.DewController` that updates once per
+    light frame: ``margin_c`` is the safety margin above the dew point,
+    ``aggressiveness`` the duty fraction commanded exactly at the
+    margin boundary, ``max_duty`` the hard cap on heater power.
+    ``sensor``/``heater`` are driver specs (``sim`` or ``indi``; the
+    INDI variants take the device/property names as options).
+    """
+    enabled: bool = False
+    margin_c: float = 2.0
+    aggressiveness: float = 0.5
+    max_duty: float = 0.9
+    sensor: DriverSpec = field(default_factory=lambda: DriverSpec("sim"))
+    heater: DriverSpec = field(default_factory=lambda: DriverSpec("sim"))
+
+
+@dataclass
+class NightConfig:
+    """Night scheduler policy (top-level ``night:`` block).
+
+    Present only when the block is in the plan.  The scheduler works
+    the ``targets:`` list until astronomical dawn, picking targets at
+    least ``min_alt_deg`` high and ``min_moon_sep_deg`` from the Moon;
+    ``time_accel`` compresses waiting in sim mode (must be >= 1).
+    """
+    latitude: float = 0.0
+    longitude: float = 0.0
+    min_alt_deg: float = 30.0
+    min_moon_sep_deg: float = 30.0
+    time_accel: float = 1.0
+
+
+@dataclass
 class DriverSpec:
     driver: str
     options: dict = field(default_factory=dict)
@@ -192,6 +246,9 @@ class Plan:
     guiding: GuidingConfig = field(default_factory=GuidingConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    dew: DewConfig = field(default_factory=DewConfig)
+    # Night scheduler policy; None when the plan has no ``night:`` block.
+    night: NightConfig | None = None
 
     def __post_init__(self) -> None:
         # Direct construction (tests, API use) skips load_plan: always keep
@@ -236,6 +293,8 @@ def load_plan(path: str | Path) -> Plan:
     guiding = _guiding_config(raw.get("guiding"), err)
     safety = _safety_config(raw.get("safety"), err)
     alerts = _alerts_config(raw.get("alerts"), err)
+    dew = _dew_config(raw.get("dew"), err)
+    night = _night_config(raw.get("night"), err)
 
     steps: list[Step] = []
     seq = raw.get("sequence")
@@ -265,6 +324,8 @@ def load_plan(path: str | Path) -> Plan:
         guiding=guiding,
         safety=safety,
         alerts=alerts,
+        dew=dew,
+        night=night,
     )
 
 
@@ -319,7 +380,11 @@ def _target_entry(raw, i: int, err) -> TargetEntry | None:
         return None
     target = _resolve_target(raw, where, err)
     ps = _platesolve_block(raw.get("platesolve"), f"{where}.platesolve", err)
-    return TargetEntry(target=target, platesolve=ps)
+    priority = _num(raw.get("priority", 1.0), f"{where}.priority", err)
+    if priority <= 0:
+        err(f"{where}.priority must be > 0, got {priority}")
+        priority = 1.0
+    return TargetEntry(target=target, platesolve=ps, priority=priority)
 
 
 def _int(value, name: str, err, minimum: int | None = None) -> int:
@@ -446,6 +511,74 @@ def _alerts_config(raw, err) -> AlertsConfig:
     return cfg
 
 
+def _dew_config(raw, err) -> DewConfig:
+    cfg = DewConfig()
+    if raw is None:
+        return cfg
+    if not isinstance(raw, dict):
+        err("dew: must be a mapping")
+        return cfg
+    cfg.enabled = bool(raw.get("enabled", False))
+    cfg.margin_c = _num(raw.get("margin_c", 2.0), "dew.margin_c", err)
+    if cfg.margin_c <= 0:
+        err(f"dew.margin_c must be > 0, got {cfg.margin_c}")
+    cfg.aggressiveness = _num(raw.get("aggressiveness", 0.5),
+                              "dew.aggressiveness", err)
+    if cfg.aggressiveness <= 0:
+        err(f"dew.aggressiveness must be > 0, got {cfg.aggressiveness}")
+    cfg.max_duty = _num(raw.get("max_duty", 0.9), "dew.max_duty", err)
+    if not (0.0 < cfg.max_duty <= 1.0):
+        err(f"dew.max_duty must be in (0, 1], got {cfg.max_duty}")
+    for key in ("sensor", "heater"):
+        sraw = raw.get(key)
+        if sraw is None:
+            continue
+        if not isinstance(sraw, dict) or "driver" not in sraw:
+            err(f"dew.{key}: needs a mapping with a 'driver' key")
+            continue
+        driver = str(sraw["driver"])
+        if driver not in ("sim", "indi"):
+            err(f"dew.{key}.driver must be 'sim' or 'indi', got {driver!r}")
+            continue
+        options = {k: v for k, v in sraw.items() if k != "driver"}
+        setattr(cfg, key, DriverSpec(driver=driver, options=options))
+    return cfg
+
+
+def _night_config(raw, err) -> NightConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        err("night: must be a mapping")
+        return None
+    cfg = NightConfig()
+    for key, lo, hi in (("latitude", -90.0, 90.0),
+                        ("longitude", -180.0, 360.0)):
+        if key not in raw or raw[key] is None:
+            err(f"night.{key} is required when the night: block is present")
+            continue
+        value = _num(raw[key], f"night.{key}", err)
+        if not (lo <= value <= hi):
+            err(f"night.{key} must be in [{lo:g}, {hi:g}], got {value}")
+        else:
+            setattr(cfg, key, value)
+    cfg.min_alt_deg = _num(raw.get("min_alt_deg", 30.0),
+                            "night.min_alt_deg", err)
+    if not (0.0 <= cfg.min_alt_deg <= 90.0):
+        err(f"night.min_alt_deg must be in [0, 90], got {cfg.min_alt_deg}")
+    cfg.min_moon_sep_deg = _num(raw.get("min_moon_sep_deg", 30.0),
+                                "night.min_moon_sep_deg", err)
+    if not (0.0 <= cfg.min_moon_sep_deg <= 180.0):
+        err(f"night.min_moon_sep_deg must be in [0, 180], "
+            f"got {cfg.min_moon_sep_deg}")
+    cfg.time_accel = _num(raw.get("time_accel", 1.0),
+                          "night.time_accel", err)
+    if cfg.time_accel < 1:
+        err(f"night.time_accel must be >= 1 (sim fast-forward), "
+            f"got {cfg.time_accel}")
+    return cfg
+
+
 def _num(value, name: str, err) -> float:
     try:
         return float(value)
@@ -545,4 +678,15 @@ def plan_summary(plan: Plan) -> str:
                  f"guide retries {sf.guide_retry_budget}{lim}")
     if plan.alerts.webhook_url:
         lines.append(f"Alerts  : webhook {plan.alerts.webhook_url}")
+    dw = plan.dew
+    lines.append("Dew     : " + (
+        f"enabled (margin {dw.margin_c:g}°C, aggressiveness "
+        f"{dw.aggressiveness:g}, max duty {dw.max_duty:g}, "
+        f"sensor={dw.sensor.driver}, heater={dw.heater.driver})"
+        if dw.enabled else "disabled"))
+    if plan.night is not None:
+        n = plan.night
+        lines.append(f"Night   : {n.latitude:.2f}°, {n.longitude:.2f}°, "
+                     f"alt≥{n.min_alt_deg:g}°, moon≥{n.min_moon_sep_deg:g}°, "
+                     f"accel {n.time_accel:g}x")
     return "\n".join(lines)

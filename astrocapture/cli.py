@@ -4,8 +4,11 @@ Usage::
 
     python -m astrocapture --config examples/sim_session.yaml   # run a session
     python -m astrocapture plan --config examples/sim_session.yaml
+    python -m astrocapture night --config examples/night_queue.yaml
     python -m astrocapture catalog "M51"             # look up a deep-sky object
     python -m astrocapture tonight --lat 43.38 --lon -80.96
+    python -m astrocapture process sessions/m51-sim-20250101-120000
+    python -m astrocapture eaa --config examples/sim_session.yaml --frames 6
     python -m astrocapture --list-drivers
 """
 
@@ -18,6 +21,9 @@ from datetime import datetime, timezone
 from astrocapture import __version__, catalog, config
 from astrocapture.dash import serve as dash_serve
 from astrocapture.drivers import available_drivers, make_camera, make_mount
+from astrocapture.eaa import run_eaa
+from astrocapture.process import process_session
+from astrocapture.scheduler import NightScheduler
 from astrocapture.sequencer import Sequencer
 
 
@@ -41,6 +47,46 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_dash(args: argparse.Namespace) -> int:
     return dash_serve(args.config, port=args.port)
+
+
+def cmd_night(args: argparse.Namespace) -> int:
+    """Run a multi-target night queue until astronomical dawn."""
+    try:
+        plan = config.load_plan(args.config)
+    except config.PlanError as exc:
+        print(f"INVALID PLAN\n{exc}", file=sys.stderr)
+        return 2
+    if plan.night is None:
+        print("ERROR: plan has no 'night:' block — add one "
+              "(see examples/night_queue.yaml)", file=sys.stderr)
+        return 2
+    print(config.plan_summary(plan))
+    print()
+
+    def factory():
+        return (make_mount(plan.mount.driver, **plan.mount.options),
+                make_camera(plan.camera.driver, **plan.camera.options))
+
+    try:
+        return NightScheduler(plan, factory).run()
+    except (ValueError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+def cmd_process(args: argparse.Namespace) -> int:
+    stats = process_session(args.session_dir, args.output)
+    print(f"Stacked {stats.get('n_stacked', 0)}/{stats.get('n_lights', 0)} "
+          f"light frames -> {args.output}")
+    for w in stats.get("warnings", []):
+        print(f"WARNING: {w}")
+    if stats.get("n_lights", 0) == 0:
+        return 1
+    return 0
+
+
+def cmd_eaa(args: argparse.Namespace) -> int:
+    return run_eaa(args.config, max_frames=args.frames)
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -154,6 +200,11 @@ def build_parser() -> argparse.ArgumentParser:
     sd.add_argument("--port", type=int, default=8765,
                     help="dashboard port (default: 8765)")
     sd.set_defaults(func=cmd_dash)
+    sn = sub.add_parser("night", help="run a multi-target night queue until dawn")
+    sn.add_argument("--config", required=True,
+                    help="plan YAML with a night: block "
+                         "(e.g. examples/night_queue.yaml)")
+    sn.set_defaults(func=cmd_night)
     sc = sub.add_parser("catalog", help="look up a deep-sky object by name")
     sc.add_argument("name", help='object name, e.g. "M51", "NGC 7000"')
     sc.set_defaults(func=cmd_catalog)
@@ -168,6 +219,22 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--min-alt", type=float, default=30.0,
                     help="minimum altitude in degrees")
     st.set_defaults(func=cmd_tonight)
+    sp2 = sub.add_parser(
+        "process",
+        help="calibrate and stack a finished session directory",
+    )
+    sp2.add_argument("session_dir", help="session directory to process")
+    sp2.add_argument("--output", default="processed",
+                     help="output directory (default: processed)")
+    sp2.set_defaults(func=cmd_process)
+    se = sub.add_parser(
+        "eaa",
+        help="live-stack a plan's light frames (EAA mode)",
+    )
+    se.add_argument("--config", required=True, help="plan YAML to run")
+    se.add_argument("--frames", type=int, default=None,
+                    help="max light frames to stack (default: all)")
+    se.set_defaults(func=cmd_eaa)
     return p
 
 

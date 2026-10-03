@@ -210,6 +210,30 @@ unattended hardware in an unknown state gets parked, not debugged);
 `max_session_hours` stops the run gracefully on a wall-clock limit.
 Alerts go to `session.log`, or POST to a webhook (`alerts.webhook_url`).
 
+**6. Dew heater control.** A top-level `dew:` block keeps the corrector
+plate above the dew point — the #1 night-killer for an SCT in humid
+Ontario. Once per light frame the controller reads ambient temperature
+and humidity, computes the dew point (Magnus formula), and ramps heater
+duty with a proportional law as the air approaches your `margin_c`
+safety margin. A sensor or heater fault logs a warning and holds the
+last duty — dew control can **never** abort imaging. Real use needs
+physical hardware (12 V dew strap + PWM controller, driven via INDI);
+the INDI device/property names are configurable and must be verified
+with `indi_getprop` on first light. Try the scripted humid night in sim:
+`examples/dew_demo.yaml`.
+
+**7. Night scheduler.** `python -m astrocapture night --config
+examples/night_queue.yaml` works your `targets:` list unattended until
+astronomical dawn. Each target gets the plan's full light sequence as
+its quota; the scheduler continuously picks the observable target
+scoring highest on priority × altitude × Moon separation, runs it in its
+own session directory, then moves on. It won't start a new target when
+less than one frame plus overhead remains before dawn, parks the mount
+if anything aborts mid-target, and writes `night_summary.md` (per-target
+frames, statuses, failures, watchdog alerts). Configure with the
+`night:` block (site coordinates, minimum altitude / Moon separation);
+`time_accel` fast-forwards waits in sim demos.
+
 Watch it live:
 
 ```bash
@@ -217,6 +241,35 @@ python -m astrocapture dash --config examples/sim_session.yaml --port 8765
 # then open http://localhost:8765 — live frame feed, FITS thumbnails,
 # session log tail, and per-frame stats as the run progresses
 ```
+
+## From photons to picture (processing + live stacking)
+
+Two post-capture workflows close the loop from FITS files to finished
+image. Both run on any platform — no hardware needed.
+
+**Calibrate + stack.** `python -m astrocapture process
+sessions/<name>-<stamp> --output processed/` builds master
+bias/dark/flat frames (sigma-clipped median combine; darks are
+exposure-scaled when they don't match the lights, with a logged note
+that scaling is approximate), calibrates each light as
+`(data − bias − dark) / flat`, registers frames by star-matching, and
+sigma-clips them into a single `stacked.fits` (32-bit float, with a
+header recording which masters were used) plus an auto-stretched
+`stacked.png` preview and a `process.log` with per-frame shifts and
+rejection counts. Registration is translation-only — fine for short
+alt-az subs; field rotation is *not* corrected (a known follow-up).
+Missing or unusable calibration frames produce a warning, never a
+crash (the sim's flats are short starfield exposures, so the pipeline
+detects the degenerate flat and skips flat-fielding with a clear log
+line instead of dividing by nonsense).
+
+**Live stacking (EAA mode).** `python -m astrocapture eaa --config
+examples/sim_session.yaml --frames 6` captures light frames and stacks
+them as they arrive, printing a running SNR estimate — great for
+outreach nights and for checking data quality while you image. Every
+frame registers against the *first* frame (never the running stack, so
+alignment can't drift). The web dashboard gains a **Live** panel
+(`/api/live.png`) showing the accumulating stack during any session.
 
 ## How it's built
 
@@ -239,12 +292,20 @@ astrocapture/
                # manual Bahtinov-mask assist_mode()
   phd2.py      # PHD2 JSON-over-TCP client (guiding, dither + settle)
   safety.py    # Watchdog (park/stop/alert policy), AlertLog, WebhookAlert
-  dash.py      # live web dashboard (frame feed, thumbnails, log tail)
+  dew.py       # dew-point heater control (Magnus law; sim + INDI backends)
+  scheduler.py # multi-target night queue until astronomical dawn
+  imaging.py   # star centroids, translation registration, FITS stretch
+  process.py   # calibration (bias/dark/flat) + sigma-clipped stacking
+  eaa.py       # live stacking (EAA mode) with running SNR estimate
+  dash.py      # live web dashboard (frame feed, thumbnails, log tail,
+               # Live-stack panel)
   cli.py       # python -m astrocapture
 examples/
   sim_session.yaml    # runs with zero hardware
   indi_session.yaml   # template for real gear (fill in YOUR device names)
   mathias_6se_t7i.yaml  # NexStar 6SE + Rebel T7i first-light plan
+  night_queue.yaml    # multi-target scheduler demo (sim, fast)
+  dew_demo.yaml       # scripted humid night for the dew controller (sim)
 tests/                # pytest tests, all passing
 ```
 
@@ -304,7 +365,13 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
       best focus; temperature-compensation hooks)
 - [x] Plate-solve re-centering loop: solve → slew to correct residual →
       re-solve until within tolerance
+- [x] Calibration + stacking pipeline: masters, registration,
+      sigma-clipped stack, `astrocapture process`
+- [x] Live stacking / EAA mode with dashboard Live panel
+- [x] Dew heater control (dew-point proportional law; needs strap hardware)
+- [x] Night scheduler: multi-target queue until astronomical dawn
 - [ ] Automated meridian flip: re-slew, re-center, resume guiding
+- [ ] Field-rotation-aware registration (for longer alt-az subs)
 - [ ] ASCOM Alpaca backend (Windows/remote-driver option)
 - [ ] First-light test log against real mount + camera
 
@@ -312,7 +379,7 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-# 108 passed
+# 169 passed
 ```
 
 Covers: plan validation (incl. multi-error reporting and the new

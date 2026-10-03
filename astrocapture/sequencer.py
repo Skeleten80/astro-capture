@@ -39,6 +39,13 @@ import time
 import numpy as np
 
 from astrocapture import config as plan_config
+from astrocapture.dew import (
+    DewController,
+    INDIDewHeater,
+    INDIWeatherSensor,
+    SimHeater,
+    SimSensor,
+)
 from astrocapture.drivers.base import Camera, Mount
 from astrocapture.focus import (
     INDIFocuser,
@@ -106,6 +113,9 @@ class Sequencer:
         self._focus_baseline_hfr = float("nan")
         self._hfr_recent: list[float] = []
         self.last_focus_position: int | None = None
+        # -- dew heater control (optional plan block) ----------------------
+        self.dew: DewController | None = None
+        self.dew_duty: float | None = None  # last commanded duty, if armed
 
     # -- external control -------------------------------------------------
     def pause(self) -> None:
@@ -209,6 +219,7 @@ class Sequencer:
         self.log.info("mount unparked")
         self._setup_guiding()
         self._setup_focuser()
+        self._setup_dew()
 
     def _is_sim_rig(self) -> bool:
         return (self.plan.mount.driver == "sim"
@@ -380,6 +391,93 @@ class Sequencer:
                               cfg.hfr_degradation_trigger)
                 self._run_autofocus("HFR degradation trigger")
 
+    # -- dew heater ---------------------------------------------------------
+    def _setup_dew(self) -> None:
+        """Arm the dew controller when the plan's ``dew:`` block is enabled.
+
+        A heater-driver failure must NEVER abort imaging: any problem
+        building the controller (or the sim/INDI drivers) is logged and
+        the run continues with dew control off.
+        """
+        cfg = self.plan.dew
+        if not cfg.enabled:
+            return
+        try:
+            sensor = self._make_dew_sensor(cfg)
+            heater = self._make_dew_heater(cfg)
+            self.dew = DewController(
+                sensor, heater,
+                margin_c=cfg.margin_c,
+                aggressiveness=cfg.aggressiveness,
+                max_duty=cfg.max_duty,
+            )
+        except Exception as exc:  # noqa: BLE001 - dew is never fatal
+            self.log.warning("dew: controller unavailable (%s) — continuing "
+                             "without dew control", exc)
+            self.dew = None
+            return
+        self.log.info("dew: controller armed (margin %.1f°C, "
+                      "aggressiveness %.2f, max duty %.0f%%)",
+                      cfg.margin_c, cfg.aggressiveness, cfg.max_duty * 100.0)
+
+    def _make_dew_sensor(self, cfg: plan_config.DewConfig):
+        driver = cfg.sensor.driver
+        if driver == "sim":
+            # Scripted humid night: temperature falls toward the dew point
+            # over the run, so the sim exercises the control law.
+            return SimSensor.humid_night(**cfg.sensor.options)
+        if driver == "indi":
+            opts = cfg.sensor.options
+            return INDIWeatherSensor(
+                host=str(opts.get("host", "localhost")),
+                port=int(opts.get("port", 7624)),
+                device=str(opts.get("device", "Weather")),
+                temp_property=str(opts.get("temp_property",
+                                           "WEATHER_TEMPERATURE")),
+                temp_item=str(opts.get("temp_item", "TEMPERATURE")),
+                rh_property=str(opts.get("rh_property", "WEATHER_HUMIDITY")),
+                rh_item=str(opts.get("rh_item", "HUMIDITY")),
+            )
+        raise ValueError(f"unknown dew sensor driver {driver!r}")
+
+    def _make_dew_heater(self, cfg: plan_config.DewConfig):
+        driver = cfg.heater.driver
+        if driver == "sim":
+            return SimHeater()
+        if driver == "indi":
+            opts = cfg.heater.options
+            return INDIDewHeater(
+                host=str(opts.get("host", "localhost")),
+                port=int(opts.get("port", 7624)),
+                device=str(opts.get("device", "Dew Heater")),
+                power_property=str(opts.get("power_property", "DEW_HEATER")),
+                power_item=str(opts.get("power_item", "DUTY")),
+            )
+        raise ValueError(f"unknown dew heater driver {driver!r}")
+
+    def _update_dew(self) -> None:
+        """One dew-control step per light frame.
+
+        Cadence choice: dew evolves on ~10-minute timescales, so
+        updating once per light frame (minute-scale exposures) tracks it
+        with negligible overhead.  ``DewController.update()`` never
+        raises; the extra guard below is belt-and-suspenders — a
+        heater-driver fault must never abort imaging.
+        """
+        if self.dew is None:
+            return
+        try:
+            duty = self.dew.update()
+        except Exception as exc:  # noqa: BLE001 - never abort on dew
+            self.log.warning("dew: update failed (%s) — continuing", exc)
+            return
+        self.dew_duty = duty
+        ctl = self.dew
+        self.log.info("dew: T=%+.1f°C RH=%.0f%% Td=%+.1f°C err=%+.1f°C "
+                      "duty=%.0f%%",
+                      ctl.last_temp_c, ctl.last_rh_pct, ctl.last_dewpoint_c,
+                      ctl.last_error_c, duty * 100.0)
+
     # -- guiding ------------------------------------------------------------
     def _setup_guiding(self) -> None:
         cfg = self.plan.guiding
@@ -544,6 +642,7 @@ class Sequencer:
             self.frames_taken += 1
             if step.type == "light":
                 self._track_frame_hfr(image)
+                self._update_dew()
             if self.plan.plate_solve and step.type == "light" and i == 0:
                 plate_solve(path, self.log)
 
