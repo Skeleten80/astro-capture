@@ -5,5 +5,7 @@ Pillow>=10.0   # dashboard FITS thumbnails
 # Optional backends (install only what you need):
 # gphoto2         # direct DSLR-over-USB (libgphoto2 system package required)
 # rawpy           # DSLR raw decode for the gphoto2 sketch
+# openai          # AI planning assistant LLM path (rule-based fallback is offline)
+# onnxruntime     # AI denoise ONNX backend (classical fallback needs nothing)
 # NOTE: the INDI backend needs no extra Python packages — it speaks the
 # INDI XML protocol over a plain TCP socket (pure stdlib).

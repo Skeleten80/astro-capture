@@ -8,6 +8,9 @@ Usage::
     python -m astrocapture catalog "M51"             # look up a deep-sky object
     python -m astrocapture tonight --lat 43.38 --lon -80.96
     python -m astrocapture process sessions/m51-sim-20250101-120000
+    python -m astrocapture process sessions/<name> --min-quality 0.5 --denoise
+    python -m astrocapture ask "image M51 tonight, 2 hours of data"
+    python -m astrocapture export-training-data sessions/<name> --output training/
     python -m astrocapture eaa --config examples/sim_session.yaml --frames 6
     python -m astrocapture --list-drivers
 """
@@ -18,11 +21,12 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
-from astrocapture import __version__, catalog, config
+from astrocapture import __version__, ai_assistant, catalog, config
 from astrocapture.dash import serve as dash_serve
 from astrocapture.drivers import available_drivers, make_camera, make_mount
 from astrocapture.eaa import run_eaa
 from astrocapture.process import process_session
+from astrocapture.quality import export_training_data
 from astrocapture.scheduler import NightScheduler
 from astrocapture.sequencer import Sequencer
 
@@ -75,13 +79,74 @@ def cmd_night(args: argparse.Namespace) -> int:
 
 
 def cmd_process(args: argparse.Namespace) -> int:
-    stats = process_session(args.session_dir, args.output)
+    denoise: bool | dict = False
+    if args.denoise_model:
+        denoise = {
+            "model": args.denoise_model,
+            "providers": (args.denoise_providers.split(",")
+                          if args.denoise_providers else None),
+        }
+    elif args.denoise:
+        denoise = True
+    try:
+        stats = process_session(
+            args.session_dir,
+            args.output,
+            quality_min_score=args.min_quality,
+            denoise=denoise,
+            trails=args.trails,
+        )
+    except (ImportError, FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     print(f"Stacked {stats.get('n_stacked', 0)}/{stats.get('n_lights', 0)} "
           f"light frames -> {args.output}")
     for w in stats.get("warnings", []):
         print(f"WARNING: {w}")
+    if stats.get("n_quality_rejected"):
+        print(f"Quality filter rejected {stats['n_quality_rejected']} frame(s)")
+    if stats.get("n_trail_rejected"):
+        print(f"Trail rejection dropped {stats['n_trail_rejected']} frame(s)")
+    if stats.get("denoised"):
+        print(f"Denoised with {stats.get('denoise_backend')} "
+              f"-> {args.output}/stacked_denoised.fits")
     if stats.get("n_lights", 0) == 0:
         return 1
+    return 0
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Build an imaging plan from natural language."""
+    print(f"Planning: {args.text!r}")
+    print(f"({ai_assistant.describe_source(args.text, use_llm=not args.no_llm)})")
+    try:
+        plan_dict = ai_assistant.plan_dict_from_text(
+            args.text, use_llm=not args.no_llm)
+        plan = ai_assistant.validate_plan_dict(plan_dict)
+    except config.PlanError as exc:
+        print(f"INVALID PLAN\n{exc}", file=sys.stderr)
+        return 2
+    print()
+    print(config.plan_summary(plan))
+    notes = plan_dict.get("notes")
+    if notes:
+        print(f"\nAssistant notes: {notes}")
+    if args.dry_run:
+        print("\n(dry run — no file written)")
+        return 0
+    out = args.output or f"{plan.session_name}.yaml"
+    ai_assistant.write_plan_yaml(plan_dict, out)
+    print(f"\nWrote {out} — validate with: "
+          f"python -m astrocapture plan --config {out}")
+    return 0
+
+
+def cmd_export_training_data(args: argparse.Namespace) -> int:
+    out = export_training_data(args.session_dir, args.output)
+    n = len(list((out / "thumbnails").glob("*.png")))
+    print(f"Exported {n} thumbnails + labels.csv -> {out}")
+    print("Next: fill in the 'label' column (1 = keep, 0 = reject), "
+          "then train a QualityModel (see README 'AI layer').")
     return 0
 
 
@@ -226,7 +291,44 @@ def build_parser() -> argparse.ArgumentParser:
     sp2.add_argument("session_dir", help="session directory to process")
     sp2.add_argument("--output", default="processed",
                      help="output directory (default: processed)")
+    sp2.add_argument("--min-quality", type=float, default=None,
+                     help="drop light frames scoring below this 0..1 "
+                          "heuristic quality (default: off)")
+    sp2.add_argument("--denoise", action="store_true",
+                     help="denoise the final stack (classical bilateral "
+                          "filter, no downloads)")
+    sp2.add_argument("--denoise-model", default=None,
+                     help="ONNX denoise model path (needs onnxruntime)")
+    sp2.add_argument("--denoise-providers", default=None,
+                     help="comma-separated ONNX providers, e.g. "
+                          "CoreMLExecutionProvider,CPUExecutionProvider")
+    sp2.add_argument("--trails", default="off",
+                     choices=["off", "reject", "mask"],
+                     help="satellite/airplane trail handling "
+                          "(default: off)")
     sp2.set_defaults(func=cmd_process)
+    sa = sub.add_parser(
+        "ask",
+        help="build an imaging plan from natural language",
+    )
+    sa.add_argument("text",
+                    help='e.g. "image M51 tonight, 2 hours of data"')
+    sa.add_argument("--dry-run", action="store_true",
+                    help="print the plan without writing a file")
+    sa.add_argument("--output", default=None,
+                    help="plan YAML path (default: <session-name>.yaml)")
+    sa.add_argument("--no-llm", action="store_true",
+                    help="force the offline rule-based parser")
+    sa.set_defaults(func=cmd_ask)
+    se2 = sub.add_parser(
+        "export-training-data",
+        help="export frame thumbnails + label CSV for training a "
+             "future quality CNN",
+    )
+    se2.add_argument("session_dir", help="session directory to export")
+    se2.add_argument("--output", default="training",
+                     help="output directory (default: training)")
+    se2.set_defaults(func=cmd_export_training_data)
     se = sub.add_parser(
         "eaa",
         help="live-stack a plan's light frames (EAA mode)",

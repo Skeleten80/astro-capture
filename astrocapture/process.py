@@ -17,16 +17,34 @@ subs where the field barely rotates; full rotation alignment (e.g. via
 a 2-D FFT / star-triangle matching) is a follow-up.
 
 Only numpy/astropy/Pillow are used (via :mod:`astrocapture.imaging`).
+
+Optional AI-layer stages (all off by default; see the "AI layer" README
+section):
+
+- ``quality_min_score`` — per-frame heuristic quality scoring
+  (:mod:`astrocapture.quality`); frames below the threshold are dropped
+  before stacking and reported in ``process.log``.
+- ``trails`` — ``"reject"`` drops frames with satellite/airplane trails,
+  ``"mask"`` inpaints trail pixels with the frame median
+  (:mod:`astrocapture.trails`).
+- ``denoise`` — final denoise of the stack: ``True``/``"classical"`` for
+  the built-in bilateral filter, or ``{"model": "x.onnx", ...}`` for a
+  user-supplied ONNX model (:mod:`astrocapture.denoise`).
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import tempfile
 from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
 
+from astrocapture import denoise as denoise_mod
+from astrocapture import quality as quality_mod
+from astrocapture import trails as trails_mod
 from astrocapture.imaging import (
     _vote_shift,
     detect_star_centroids,
@@ -338,9 +356,46 @@ def _fits_paths(directory: Path) -> list[Path]:
     return sorted(p for p in directory.glob("*.fits") if p.is_file())
 
 
+@contextlib.contextmanager
+def _trail_masked_lights(light_paths: list[Path], mode: str, note):
+    """Yield the light paths to stack.
+
+    In ``"mask"`` mode, frames with detected trails are copied with
+    trail pixels replaced by the frame median (crude inpainting, but it
+    keeps the frame's stars usable for stacking); the copies live in a
+    temporary directory that is removed after stacking.  Other modes
+    yield the original paths untouched.
+    """
+    if mode != "mask":
+        yield list(light_paths)
+        return
+    with tempfile.TemporaryDirectory(prefix="detrailed-") as tmp:
+        out: list[Path] = []
+        for p in light_paths:
+            data, hdr = _load_fits(p)
+            found = trails_mod.detect_trails(data)
+            if found:
+                mask = trails_mod.trail_mask(data.shape, found)
+                filled = data.copy()
+                filled[mask] = float(np.median(data))
+                q = Path(tmp) / p.name
+                fits.writeto(q, filled.astype(np.float32), hdr,
+                             overwrite=True)
+                note(f"  {p.name}: masked {len(found)} trail(s) "
+                     f"({int(mask.sum())} px inpainted)")
+                out.append(q)
+            else:
+                out.append(p)
+        yield out
+
+
 def process_session(
     session_dir: str | Path,
     output_dir: str | Path,
+    *,
+    quality_min_score: float | None = None,
+    denoise: bool | dict = False,
+    trails: str = "off",
 ) -> dict:
     """Calibrate + stack every light frame in a session directory.
 
@@ -350,7 +405,21 @@ def process_session(
     - ``stacked.fits`` — 32-bit float stack, header noting which masters
       were used (or that none were available),
     - ``stacked.png`` — auto-stretched preview (:func:`stretch_png`),
-    - ``process.log`` — masters built, per-frame shifts, rejections.
+    - ``stacked_denoised.fits`` / ``stacked_denoised.png`` — only when
+      ``denoise`` is enabled,
+    - ``process.log`` — masters built, quality/trail rejections,
+      per-frame shifts, denoise backend.
+
+    Optional AI-layer stages (all off by default):
+
+    - ``quality_min_score``: drop light frames scoring below this
+      (heuristic 0..1 model, :mod:`astrocapture.quality`).
+    - ``trails``: ``"off"`` | ``"reject"`` (drop trailed frames) |
+      ``"mask"`` (inpaint trail pixels with the frame median).
+    - ``denoise``: ``True``/``"classical"`` for the built-in bilateral
+      filter, or ``{"model": "path.onnx", "providers": [...]}`` for a
+      user-supplied ONNX model.  A bad denoise spec fails fast, before
+      any stacking.
 
     Missing calibration frames never crash the run: the stack proceeds
     on raw (or partially calibrated) lights and the warning is recorded
@@ -359,6 +428,12 @@ def process_session(
     session_dir = Path(session_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fail fast on misconfigured optional stages, before any work.
+    if trails not in ("off", "reject", "mask"):
+        raise ValueError(
+            f"trails must be 'off', 'reject' or 'mask', got {trails!r}")
+    denoiser = denoise_mod.make_denoiser(denoise)
 
     log_lines: list[str] = []
 
@@ -388,6 +463,57 @@ def process_session(
         note("WARNING: " + msg)
         _write_log(output_dir, log_lines)
         return stats
+
+    # -- AI layer: quality filter --------------------------------------
+    if quality_min_score is not None:
+        scores = quality_mod.score_frames(lights)
+        kept = [Path(s["path"]) for s in scores
+                if s["overall"] >= quality_min_score]
+        dropped = [s for s in scores if s["overall"] < quality_min_score]
+        stats["n_quality_rejected"] = len(dropped)
+        for s in scores:
+            verdict = ("REJECTED"
+                       if s["overall"] < quality_min_score else "kept")
+            note(f"  {Path(s['path']).name}: quality {s['overall']:.3f} "
+                 f"(trail {s['trailing']:.2f} cloud {s['cloud']:.2f} "
+                 f"focus {s['focus']:.2f}) {verdict}")
+        note(f"quality filter (min {quality_min_score:g}): "
+             f"kept {len(kept)}/{len(lights)}")
+        lights = kept
+        if not lights:
+            msg = ("every light frame failed the quality filter — "
+                   "nothing to stack")
+            stats["warnings"].append(msg)
+            note("WARNING: " + msg)
+            _write_log(output_dir, log_lines)
+            return stats
+
+    # -- AI layer: trail policy ----------------------------------------
+    if trails == "reject":
+        survivors: list[Path] = []
+        n_trailed = 0
+        for p in lights:
+            data, _hdr = _load_fits(p)
+            found = trails_mod.detect_trails(data)
+            if found:
+                n_trailed += 1
+                longest = max(t["length_px"] for t in found)
+                note(f"  {p.name}: REJECTED "
+                     f"({len(found)} trail(s), longest {longest:.0f}px)")
+            else:
+                survivors.append(p)
+        stats["n_trail_rejected"] = n_trailed
+        note(f"trail rejection: dropped {n_trailed}/{len(lights)} "
+             f"frames with trails")
+        lights = survivors
+        if not lights:
+            msg = "every light frame contained trails — nothing to stack"
+            stats["warnings"].append(msg)
+            note("WARNING: " + msg)
+            _write_log(output_dir, log_lines)
+            return stats
+    else:
+        stats["n_trail_rejected"] = 0
 
     # -- masters ---------------------------------------------------------
     master_bias = None
@@ -451,16 +577,18 @@ def process_session(
         note("WARNING: no flat frames; lights not flat-fielded")
 
     # -- stack -----------------------------------------------------------
-    stack, sstats = stack_lights(
-        lights, bias=master_bias, dark=master_dark, flat=master_flat
-    )
-    stats.update(sstats)
-    note(
-        f"stacked {sstats['n_stacked']}/{sstats['n_input']} lights "
-        f"({sstats['n_rejected']} rejected)"
-    )
-    for p, sh in zip(lights, sstats["shifts"]):
-        note(f"  {p.name}: shift {sh if sh else 'DROPPED (no registration)'}")
+    with _trail_masked_lights(lights, trails, note) as to_stack:
+        stack, sstats = stack_lights(
+            to_stack, bias=master_bias, dark=master_dark, flat=master_flat
+        )
+        stats.update(sstats)
+        note(
+            f"stacked {sstats['n_stacked']}/{sstats['n_input']} lights "
+            f"({sstats['n_rejected']} rejected)"
+        )
+        for p, sh in zip(to_stack, sstats["shifts"]):
+            note(f"  {Path(p).name}: shift "
+                 f"{sh if sh else 'DROPPED (no registration)'}")
 
     # -- outputs ---------------------------------------------------------
     hdr = fits.Header()
@@ -483,6 +611,26 @@ def process_session(
 
     (output_dir / "stacked.png").write_bytes(stretch_png(stack))
     note("wrote stacked.png")
+
+    # -- AI layer: denoise (optional final step) --------------------------
+    stats["denoised"] = False
+    if denoiser is not None:
+        backend = type(denoiser).__name__
+        dstack = denoiser.denoise(stack)
+        stats["denoised"] = True
+        stats["denoise_backend"] = backend
+        dhdr = fits.Header()
+        dhdr["IMAGETYP"] = ("DENOISED STACK", "Denoised sigma-clipped stack")
+        dhdr["NSTACK"] = (sstats["n_stacked"], "Frames in stack")
+        dhdr["DENOISER"] = (backend, "Denoising backend")
+        dhdr["BITPIX"] = -32
+        dhdr["BUNIT"] = ("ADU", "Pixel units")
+        dhdr["CREATOR"] = ("AstroCapture process", "Denoised stack output")
+        fits.writeto(output_dir / "stacked_denoised.fits", dstack, dhdr,
+                     overwrite=True)
+        (output_dir / "stacked_denoised.png").write_bytes(
+            stretch_png(dstack))
+        note(f"denoised with {backend} -> stacked_denoised.fits/png")
 
     _write_log(output_dir, log_lines)
     return stats

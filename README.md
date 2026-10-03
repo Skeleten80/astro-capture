@@ -271,6 +271,64 @@ frame registers against the *first* frame (never the running stack, so
 alignment can't drift). The web dashboard gains a **Live** panel
 (`/api/live.png`) showing the accumulating stack during any session.
 
+## AI layer
+
+Four optional AI-flavored features. The honest summary up front: **no
+trained models are shipped** — the LLM path needs your own
+`OPENAI_API_KEY`, the ONNX denoise slot accepts a model file *you*
+supply, and everywhere a learned model would go there is a classical
+fallback that works out of the box. What's real is documented below;
+what's stubbed says so.
+
+**1. Natural-language planning** (`astrocapture/ai_assistant.py`).
+`python -m astrocapture ask "image the Whirlpool Galaxy tonight, 2 hours
+of data" [--dry-run]` turns English into a validated plan YAML. With
+`OPENAI_API_KEY` set (and the optional `openai` package installed) an
+LLM drafts the plan under a system prompt that encodes your exact rig —
+6SE alt-az 25 s sub cap, T7i ISO 1600, dither every 3, matching
+calibration frames — and must return STRICT JSON, which is then
+schema-checked *and* run through the real plan validator (target names
+resolve through the night-sky catalog). Raw LLM output is never
+trusted. Without a key, the offline rule-based parser takes over:
+catalog designation/common-name lookup, "2 hours" → frame counts, sub
+lengths clamped to 25 s.
+
+**2. Bad-frame quality scoring** (`astrocapture/quality.py`). Heuristic
+v1 — explicitly *not* a neural net: per-frame scores 0..1 from star
+trailing (median stellar eccentricity via second moments), cloud/haze
+(background + noise drift vs. the session baseline), and focus softness
+(median HFR vs. the session's best). The overall score is the geometric
+mean, so one bad axis tanks the frame. `python -m astrocapture process
+sessions/<name> --min-quality 0.5` drops low scorers before stacking
+(reported per-frame in `process.log`). `python -m astrocapture
+export-training-data sessions/<name> --output training/` writes frame
+thumbnails plus a `labels.csv` with an empty `label` column — fill it in
+(1 = keep, 0 = reject) and you have the dataset for the small CNN that
+will one day implement the `QualityModel` interface (`score(frame) ->
+float`); the heuristic columns ship as free input features.
+
+**3. AI denoise, classical fallback** (`astrocapture/denoise.py`).
+`python -m astrocapture process sessions/<name> --denoise` runs an
+edge-aware bilateral filter (pure numpy, measurably improves SNR) as the
+final step, writing `stacked_denoised.fits/png`. `--denoise-model
+model.onnx [--denoise-providers
+CoreMLExecutionProvider,CPUExecutionProvider]` instead runs a
+user-supplied ONNX model via onnxruntime (guarded import — a clear
+error if it's not installed); the CoreML provider dispatches to the
+Neural Engine on Apple Silicon, the same pattern as the car-logger
+vision stack. We ship no trained astro denoise model; the ONNX slot is
+ready for community models.
+
+**4. Satellite/airplane trail detection** (`astrocapture/trails.py`).
+Numpy-only: stars are masked (round detections only — the trail's own
+flat-topped maxima are eccentricity-gated so the trail can't mask
+itself), remaining bright pixels go through RANSAC line voting, and a
+candidate counts only if its *longest continuous run* spans ≥ 60 px —
+random star cores that merely align leave hundred-pixel gaps and are
+rejected. `python -m astrocapture process sessions/<name> --trails
+reject` drops trailed frames; `--trails mask` inpaints trail pixels
+with the frame median and keeps the frame. Counts land in `process.log`.
+
 ## How it's built
 
 ```
@@ -370,8 +428,13 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 - [x] Live stacking / EAA mode with dashboard Live panel
 - [x] Dew heater control (dew-point proportional law; needs strap hardware)
 - [x] Night scheduler: multi-target queue until astronomical dawn
+- [x] AI layer: natural-language planning (LLM + offline fallback),
+      heuristic bad-frame scoring + training-data export, classical/ONNX
+      denoise, satellite-trail detection
 - [ ] Automated meridian flip: re-slew, re-center, resume guiding
 - [ ] Field-rotation-aware registration (for longer alt-az subs)
+- [ ] Learned quality CNN trained on exported labels (plugs into
+      `quality.QualityModel`)
 - [ ] ASCOM Alpaca backend (Windows/remote-driver option)
 - [ ] First-light test log against real mount + camera
 
@@ -379,7 +442,7 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-# 169 passed
+# 208 passed, 1 skipped (onnxruntime-present variant; onnxruntime not installed)
 ```
 
 Covers: plan validation (incl. multi-error reporting and the new
@@ -397,4 +460,11 @@ star-lost), the safety watchdog (solve-failure parking, guide retry
 budget, exceptions, session limits, webhooks), and the sequencer
 integration of all five (platesolve success/failure, multi-target runs,
 autofocus, PHD2 fallback, guide-lost parking, exception parking, config
-validation).
+validation), plus the AI layer: LLM planning (mocked client, strict
+JSON, sub-cap enforcement, fence stripping), rule-based planning
+(designations, common names, time parsing, sub clamping, offline
+fallback), heuristic quality scoring (sharp/trailed/cloudy ordering,
+unit range, training export), classical denoise (SNR gain, edge
+preservation, ONNX error paths), and trail detection (angles, clean
+frames, short-line and aligned-clump rejection, process
+reject/mask integration).
