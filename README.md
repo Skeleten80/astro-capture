@@ -1,15 +1,49 @@
-# AstroCapture
+![AstroCapture](assets/hero.svg)
 
-Telescope + camera control and automated capture sequencing for
-astrophotography. You write an imaging plan in YAML; AstroCapture slews
-the mount, runs the exposure sequence (lights / darks / flats / bias),
-dithers between frames, and saves calibrated FITS files with proper
-headers into a timestamped session directory.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-8a93a8)](https://github.com/Skeleten80/astro-capture)
+[![License: MIT](https://img.shields.io/badge/license-MIT-3da35d)](LICENSE)
+[![Sim mode](https://img.shields.io/badge/sim%20mode-no%20hardware%20needed-e8a33d)](examples/sim_session.yaml)
 
-**Status: v0.1.0 scaffold. The simulator runs end-to-end today. The INDI
-backend is a pure-Python protocol client (no compiled dependencies —
-runs on Linux, macOS and Windows) but has NOT been tested against real
-hardware** — see [Caveats](#caveats).
+**Automated astrophotography capture — YAML plans, INDI control, calibrated FITS.**
+
+You write an imaging plan in YAML. AstroCapture slews the mount, runs the
+exposure sequence (lights, darks, flats, biases) with dithering between frames,
+and writes calibrated FITS files with proper headers into a timestamped
+session directory. The INDI backend is a pure-Python protocol client — zero
+compiled dependencies — and a full simulator runs end-to-end with no hardware
+at all.
+
+![Live dashboard](assets/dashboard.png)
+![Simulated session output](assets/terminal.png)
+
+## Features
+
+- **YAML sequencer** — lights / darks / flats / bias with dithering,
+  thread-safe pause / resume / abort, fails-fast plan validation
+- **Pure-Python INDI v1.7 client** — stdlib socket + XML, no PyIndi-Client,
+  no compiler; runs on Linux, macOS, and Windows
+- **Autonomous imaging** — V-curve autofocus (with manual-assist mode for
+  focusers that don't exist), plate-solve recentering, PHD2 guiding with
+  dither + settle, dew-point heater control, safety watchdog that parks on
+  trouble
+- **Night scheduler** — multi-target queue that works your target list
+  unattended until astronomical dawn, highest priority × altitude × Moon
+  separation first
+- **Processing pipeline** — master bias/dark/flat calibration, star-matched
+  registration, sigma-clipped stacking, plus live stacking (EAA mode) with
+  running SNR
+- **Web dashboard** — live frame feed, FITS thumbnails, session log tail,
+  per-frame stats, live-stack panel
+- **Night-sky catalog** — 5,045 deep-sky objects vendored; `target:
+  {name: "M51"}` resolves coordinates at plan load
+- **Sim mode** — `SimMount` (great-circle slews) + `SimCamera` (seeded
+  starfield with shot noise, read noise, hot pixels); a full session runs
+  in ~35 seconds with zero hardware
+- **AI layer** — natural-language planning (LLM with offline fallback),
+  heuristic bad-frame scoring, classical/ONNX denoise, satellite-trail
+  detection. Honest note: no trained models are shipped; every learned
+  slot has a classical fallback that works out of the box.
 
 ## Quick start (no hardware needed)
 
@@ -21,15 +55,41 @@ pip install -r requirements.txt
 # Validate the example plan
 python -m astrocapture plan --config examples/sim_session.yaml
 
-# Run a full simulated session (~30 s): slew, 4 lights + dither,
+# Run a full simulated session (~35 s): slew, 4 lights + dither,
 # 2 darks, 2 flats, 3 biases, park. Output lands in sessions/
 python -m astrocapture --config examples/sim_session.yaml
 
 # What drivers are available on this machine?
 python -m astrocapture --list-drivers
+
+# Watch it live in the browser
+python -m astrocapture dash --config examples/sim_session.yaml --port 8765
+# then open http://localhost:8765
 ```
 
-## Install
+## How it works
+
+```mermaid
+flowchart TD
+    PLAN["night plan YAML"] --> VALIDATE["config.py — validation\n(fails fast, lists all errors)"]
+    VALIDATE --> SEQ["sequencer.py — state machine\nSLEW → EXPOSE → DITHER … DONE"]
+    SEQ --> DRV{"drivers/"}
+    DRV --> INDI["indi.py — pure-Python\nINDI v1.7 XML client"]
+    DRV --> SIM["sim.py — SimMount +\nSimCamera (synthetic sky)"]
+    DRV --> DSLR["dslr.py — gphoto2\nsketch (guarded import)"]
+    INDI --> OUT["session.py — timestamped\nsession dir, calibrated FITS\nwith proper headers"]
+    SIM --> OUT
+    DSLR --> OUT
+    SEQ -.-> |optional| AUTO["platesolve · autofocus ·\nPHD2 guiding · dew · watchdog"]
+```
+
+## Hardware
+
+Built around a **Celestron NexStar 6SE + Canon EOS Rebel T7i**, but the
+driver abstraction means any INDI-supported mount and camera works.
+`examples/mathias_6se_t7i.yaml` is a ready-to-edit first-light plan for
+that exact gear — 30× 25 s lights at ISO 1600 on M13, plus matching
+calibration frames.
 
 **Recommended architecture:** `indiserver` runs on a small Linux box at
 the scope (a Raspberry Pi is the classic choice — it holds the USB
@@ -112,11 +172,7 @@ Either way: set your DSLR to **manual mode, manual focus, RAW**, disable
 auto power-off and in-camera long-exposure noise reduction (you take
 darks for that), and use a dummy battery / AC adapter.
 
-## Mathias's setup (NexStar 6SE + Rebel T7i)
-
-`examples/mathias_6se_t7i.yaml` is a ready-to-edit first-light plan for
-this exact gear — 30× 25 s lights at ISO 1600 on M13, plus matching
-darks/flats/biases.
+### Mathias's setup (NexStar 6SE + Rebel T7i)
 
 **Physical chain**
 
@@ -234,14 +290,6 @@ frames, statuses, failures, watchdog alerts). Configure with the
 `night:` block (site coordinates, minimum altitude / Moon separation);
 `time_accel` fast-forwards waits in sim demos.
 
-Watch it live:
-
-```bash
-python -m astrocapture dash --config examples/sim_session.yaml --port 8765
-# then open http://localhost:8765 — live frame feed, FITS thumbnails,
-# session log tail, and per-frame stats as the run progresses
-```
-
 ## From photons to picture (processing + live stacking)
 
 Two post-capture workflows close the loop from FITS files to finished
@@ -273,7 +321,7 @@ alignment can't drift). The web dashboard gains a **Live** panel
 
 ## AI layer
 
-Four optional AI-flavored features. The honest summary up front: **no
+Four optional AI-flavoured features. The honest summary up front: **no
 trained models are shipped** — the LLM path needs your own
 `OPENAI_API_KEY`, the ONNX denoise slot accepts a model file *you*
 supply, and everywhere a learned model would go there is a classical
@@ -393,48 +441,44 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 `IMAGETYP`, `DATE-OBS`, `INSTRUME`, `TELESCOP`, `FILTER`, `GAIN`/`ISO`,
 `XBINNING`/`YBINNING`, `CCD-TEMP`, `BUNIT=ADU`.
 
-## Caveats
+## Status and caveats
 
-- **Not yet tested against real hardware.** The INDI backend speaks the
-  INDI v1.7 XML protocol directly (verified against the spec, and
-  exercised end-to-end against a scripted fake server in
-  `tests/test_indi_proto.py`), using standard INDI property names
-  (`EQUATORIAL_EOD_COORD`, `TELESCOPE_PARK`, `CCD_EXPOSURE`, …) — but
-  property names vary between drivers, so expect a debugging session
-  with `indi_getprop` on first light. Known variation points are marked
-  in `drivers/indi.py` comments. (The old PyIndi-Client approach was
-  dropped because that package currently fails to build against modern
-  libindi.)
-- The gphoto2 backend's bulb path is per-model and untested.
-- Meridian-flip *detection* exists (`check_meridian_flip`); the flip
-  itself currently pauses the sequence for you to flip manually.
-- Plate solving shells out to a local `solve-field`; without
-  astrometry.net installed the per-target recenter block logs "skipped"
-  and continues (a missing binary is inconclusive, never a failure).
-- The PHD2 client speaks the documented JSON-over-TCP API but has not
-  been exercised against a live PHD2 yet; guiding paths are covered by
-  test doubles in `tests/test_sequencer_integration.py`.
+**What works today:** the simulator runs end-to-end — plan validation,
+slew, dithered exposures, calibration frames, parking — with 209 tests
+passing. Everything above marked "sim" is real, exercised code.
+
+**The honest caveat:** the INDI backend has **not been tested against
+real hardware**. It speaks the INDI v1.7 XML protocol directly (verified
+against the spec, and exercised end-to-end against a scripted fake
+server in `tests/test_indi_proto.py`), using standard INDI property
+names (`EQUATORIAL_EOD_COORD`, `TELESCOPE_PARK`, `CCD_EXPOSURE`, …) —
+but property names vary between drivers, so expect a debugging session
+with `indi_getprop` on first light. Known variation points are marked
+in `drivers/indi.py` comments. (The old PyIndi-Client approach was
+dropped because that package currently fails to build against modern
+libindi.)
+
+Also: the gphoto2 backend's bulb path is per-model and untested;
+meridian-flip *detection* exists but the flip itself currently pauses
+for a manual flip; the PHD2 client speaks the documented API but hasn't
+met a live PHD2 yet; plate solving needs a local astrometry.net
+install (without it, the block logs "skipped" and imaging continues).
 
 ## Roadmap
 
-- [x] Autoguiding via the PHD2 API (dither handshake + settle, instead
-      of the timed settle used now)
+- [x] Autoguiding via the PHD2 API (dither handshake + settle)
 - [x] Autofocus V-curve routine (sweep focuser, fit HFR curve, move to
       best focus; temperature-compensation hooks)
-- [x] Plate-solve re-centering loop: solve → slew to correct residual →
-      re-solve until within tolerance
-- [x] Calibration + stacking pipeline: masters, registration,
-      sigma-clipped stack, `astrocapture process`
+- [x] Plate-solve re-centering loop
+- [x] Calibration + stacking pipeline
 - [x] Live stacking / EAA mode with dashboard Live panel
-- [x] Dew heater control (dew-point proportional law; needs strap hardware)
+- [x] Dew heater control (dew-point proportional law)
 - [x] Night scheduler: multi-target queue until astronomical dawn
-- [x] AI layer: natural-language planning (LLM + offline fallback),
-      heuristic bad-frame scoring + training-data export, classical/ONNX
-      denoise, satellite-trail detection
+- [x] AI layer: natural-language planning, heuristic bad-frame scoring,
+      classical/ONNX denoise, satellite-trail detection
 - [ ] Automated meridian flip: re-slew, re-center, resume guiding
 - [ ] Field-rotation-aware registration (for longer alt-az subs)
-- [ ] Learned quality CNN trained on exported labels (plugs into
-      `quality.QualityModel`)
+- [ ] Learned quality CNN trained on exported labels
 - [ ] ASCOM Alpaca backend (Windows/remote-driver option)
 - [ ] First-light test log against real mount + camera
 
@@ -442,29 +486,29 @@ FITS headers include `OBJECT`, `RA`/`DEC` (J2000 deg), `EXPTIME`,
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-# 208 passed, 1 skipped (onnxruntime-present variant; onnxruntime not installed)
+# 209 passed, 1 skipped (onnxruntime-present variant; onnxruntime not installed)
 ```
 
-Covers: plan validation (incl. multi-error reporting and the new
-autonomous-imaging blocks), sim slew math (monotonic approach, rate
-timing, RA wrap, park), synthetic image properties (shape/dtype,
-exposure scaling, dither shift, FITS round-trip), sequencer state
-machine (full run, pause/resume, abort), FITS header contents, the
-pure-Python INDI client (handshake, goto RA/Dec XML, park switch, slew
-Busy→Ok, exposure → real FITS bytes via a scripted fake INDI server),
-the night-sky catalog (5,045 objects, lookup, tonight ranking), HFR
-measurement + V-curve autofocus (SimFocuser, INDIFocuser against a fake
-server, manual assist mode), plate solving + closed-loop recentering
-(FakeSolver), the PHD2 client (protocol framing, dither/settle,
-star-lost), the safety watchdog (solve-failure parking, guide retry
-budget, exceptions, session limits, webhooks), and the sequencer
-integration of all five (platesolve success/failure, multi-target runs,
-autofocus, PHD2 fallback, guide-lost parking, exception parking, config
-validation), plus the AI layer: LLM planning (mocked client, strict
-JSON, sub-cap enforcement, fence stripping), rule-based planning
-(designations, common names, time parsing, sub clamping, offline
-fallback), heuristic quality scoring (sharp/trailed/cloudy ordering,
-unit range, training export), classical denoise (SNR gain, edge
-preservation, ONNX error paths), and trail detection (angles, clean
-frames, short-line and aligned-clump rejection, process
-reject/mask integration).
+Covers: plan validation (incl. multi-error reporting), sim slew math,
+synthetic image properties, the sequencer state machine (full run,
+pause/resume, abort), FITS header contents, the pure-Python INDI client
+(handshake, goto RA/Dec XML, park switch, slew Busy→Ok, exposure → real
+FITS bytes via a scripted fake INDI server), the night-sky catalog,
+HFR + V-curve autofocus, plate solving + closed-loop recentering, the
+PHD2 client, the safety watchdog, sequencer integration, plus the AI
+layer: LLM planning (mocked), rule-based planning, heuristic quality
+scoring, classical denoise, and trail detection.
+
+## Related projects
+
+- **[ScopePilot](https://github.com/Skeleten80/scopepilot)** — Python
+  telescope control for the Celestron NexStar 6SE: NexStar hand-controller
+  serial protocol driver, guided 3-star pointing model, closed-loop
+  plate-solve centering, and a web hand-controller dashboard.
+- **[AstroTonight](https://github.com/Skeleten80/astro-tonight)** — the
+  planning side: what's worth imaging tonight, tonight's grade, schedule
+  tracking, and plan export into AstroCapture's YAML format.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
