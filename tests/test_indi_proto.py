@@ -39,7 +39,12 @@ def _def(kind: str, device: str, name: str, items: list[tuple[str, str]],
 
 
 class FakeINDIServer(threading.Thread):
-    """Minimal scripted INDI server for protocol tests."""
+    """Minimal scripted INDI server for protocol tests.
+
+    Note: do not name a method ``_handle`` here. On Python 3.13+
+    ``threading.Thread`` stores its own ``_handle`` attribute, which would
+    shadow the method (TypeError: '_thread._ThreadHandle' object is not callable).
+    """
 
     def __init__(self) -> None:
         super().__init__(daemon=True)
@@ -104,7 +109,7 @@ class FakeINDIServer(threading.Thread):
             fn()
         threading.Thread(target=run, daemon=True).start()
 
-    def _handle(self, xml: str, conn: socket.socket) -> None:
+    def _handle_message(self, xml: str, conn: socket.socket) -> None:
         el = ET.fromstring(xml)
         tag = el.tag
         device, name = el.get("device"), el.get("name")
@@ -167,7 +172,7 @@ class FakeINDIServer(threading.Thread):
                 buffer += chunk.decode()
                 elements, buffer = _split_elements(buffer)
                 for xml in elements:
-                    self._handle(xml, conn)
+                    self._handle_message(xml, conn)
         except OSError:
             pass
         finally:
